@@ -26,6 +26,8 @@
      → 未登录上传 401 → 无文件 400 → 版本格式不对 400
      → 上传 1.0.1 后 version/dowload 对得上（sha256 与内容一致）
      → 再传 1.0.2 覆盖旧版
+  18. 管理页含发布新版表单：文件框 + 版本号 + 更新说明 + 上传按钮
+     + 上传逻辑（/api/admin/release、正在上传、512MB 提示），且不含真实 Key/Token
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -504,6 +506,22 @@ def test_admin_page_presets():
         assert needle in raw, "管理页缺预置内容：%s" % needle
 
 
+def test_admin_page_release_form():
+    # 管理页应含发布新版表单：文件框 + 版本号 + 更新说明 + 上传按钮 + 上传逻辑
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    for needle in [
+        "发布新版", 'id="releaseFile"', 'id="releaseVersion"',
+        'id="releaseNotes"', 'id="releaseBtn"', 'id="releaseMsg"',
+        "uploadRelease()", "/api/admin/release",
+        "正在上传", "512MB", "1.0.1",
+    ]:
+        assert needle in raw, "管理页缺发布表单内容：%s" % needle
+    # 表单与上传逻辑里不含任何真实 Key/Token
+    assert API_KEY not in raw, "管理页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
+
+
 def test_release_flow():
     # 注意：此时 relay 是测试 15 重启后的无 Key 配置，app_token 是 APP_TOKEN，
     # 管理员会话在 STATE["cookie"] 里。
@@ -602,6 +620,7 @@ TESTS = [
     ("daily_limit=2 时第 3 次 429", test_daily_limit_429),
     ("无 Key 拉模型 400", test_models_no_key),
     ("管理页含服务商预置下拉框与白名单说明", test_admin_page_presets),
+    ("管理页含发布新版表单", test_admin_page_release_form),
     ("自动更新：上传发布 → version/download 核对", test_release_flow),
 ]
 

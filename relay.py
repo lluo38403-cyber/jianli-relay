@@ -443,6 +443,7 @@ PAGE_CONFIG = """<!doctype html>
 body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}
 label{display:block;margin:12px 0 4px;font-weight:bold}
 input[type=text],input[type=password]{width:100%;box-sizing:border-box;font-size:15px;padding:8px}
+input[type=file]{width:100%;box-sizing:border-box;font-size:15px;padding:8px 0}
 button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 .hint{color:#666;font-size:13px}
 #msg{color:#b00}
@@ -490,6 +491,19 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 </div>
 <p id="newToken"></p>
 <p id="msg"></p>
+<hr>
+<h2>发布新版</h2>
+<p class="hint">上传新的安装包（zip），用户打开面板时会自动收到更新提示。只传 zip，超过 512MB 传不上去。</p>
+<label>安装包（zip）</label>
+<input id="releaseFile" type="file" accept=".zip,application/zip">
+<label>版本号</label>
+<input id="releaseVersion" type="text" placeholder="例如 1.0.1" inputmode="numeric">
+<label>更新说明</label>
+<input id="releaseNotes" type="text" placeholder="例如：修复了投递失败的问题（可选）">
+<div>
+<button id="releaseBtn" onclick="uploadRelease()">上传并发布</button>
+</div>
+<p id="releaseMsg"></p>
 <script>
 async function api(path,method,body){
   var opts={method:method||'GET',headers:{'Content-Type':'application/json'}};
@@ -600,6 +614,76 @@ async function rotate(){
     load();
   } else {
     document.getElementById('msg').textContent='轮换失败：'+(r.data.error||('HTTP '+r.status));
+  }
+}
+var MAX_RELEASE_BYTES=512*1024*1024; // 后端上限 512MB，超了返回 413
+function fmtSize(n){
+  if(n>=1024*1024){return (n/1024/1024).toFixed(1)+' MB';}
+  if(n>=1024){return (n/1024).toFixed(1)+' KB';}
+  return n+' 字节';
+}
+function releaseErrText(code,status){
+  // 后端错误码转大白话（后端原样返回，这里只做文案映射）
+  var map={
+    unauthorized:'未登录或会话过期，请刷新页面重新登录。',
+    no_file:'没有选择安装包，请先选一个 zip 文件。',
+    invalid_version:'版本号格式不对，应为 x.y.z，例如 1.0.1。',
+    too_large:'安装包太大了，超过 512MB，传不上去。',
+    invalid_multipart:'上传失败，文件可能有问题，请重新选择再试。',
+    invalid_content_type:'上传失败，请重试。',
+    invalid_request:'上传失败，请重试。'
+  };
+  if(code&&map[code]){return map[code];}
+  if(status===413){return '安装包太大了，超过 512MB，传不上去。';}
+  if(status===401){return '未登录或会话过期，请刷新页面重新登录。';}
+  return '上传失败，请稍后重试。';
+}
+async function uploadRelease(){
+  var fileInput=document.getElementById('releaseFile');
+  var versionInput=document.getElementById('releaseVersion');
+  var notesInput=document.getElementById('releaseNotes');
+  var btn=document.getElementById('releaseBtn');
+  var msg=document.getElementById('releaseMsg');
+  var file=fileInput.files&&fileInput.files[0];
+  if(!file){msg.style.color='#b00';msg.textContent='请先选择安装包（zip）。';return;}
+  if(file.size>MAX_RELEASE_BYTES){
+    msg.style.color='#b00';
+    msg.textContent='安装包太大了（'+fmtSize(file.size)+'），超过 512MB，传不上去。';
+    return;
+  }
+  var version=versionInput.value.trim();
+  if(!/^\d+\.\d+\.\d+$/.test(version)){
+    msg.style.color='#b00';
+    msg.textContent='版本号格式不对，应为 x.y.z，例如 1.0.1。';
+    return;
+  }
+  var fd=new FormData();
+  fd.append('file',file);
+  fd.append('version',version);
+  fd.append('notes',notesInput.value);
+  btn.disabled=true;
+  btn.textContent='正在上传…';
+  msg.style.color='';
+  msg.textContent='';
+  try{
+    var r=await fetch('/api/admin/release',{method:'POST',body:fd});
+    var d=await r.json().catch(function(){return {};});
+    if(r.ok){
+      msg.style.color='#080';
+      msg.textContent='已发布新版 '+(d.version||version)+'（'+fmtSize(file.size)+'），用户打开面板时会自动收到更新提示。';
+      fileInput.value='';
+      versionInput.value='';
+      notesInput.value='';
+    }else{
+      msg.style.color='#b00';
+      msg.textContent='发布失败：'+releaseErrText(d.error,r.status);
+    }
+  }catch(e){
+    msg.style.color='#b00';
+    msg.textContent='发布失败：网络不通，请检查后重试。';
+  }finally{
+    btn.disabled=false;
+    btn.textContent='上传并发布';
   }
 }
 async function logout(){
