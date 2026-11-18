@@ -1,0 +1,15 @@
+[Unit]
+Description=简历猎手 AI 云端中转
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/jianli-relay/relay.py
+WorkingDirectory=/root/jianli-relay
+Environment=RELAY_CONFIG=/root/jianli-relay/config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

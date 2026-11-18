@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""relay.py 本地验证脚本（Python 标准库 only，不连外网）。
+
+起一个桩上游服务商（OpenAI 兼容，127.0.0.1:18099，收到请求返回固定文本）
++ relay（127.0.0.1:18098，临时配置），断言：
+
+  1. chat 200 返回桩文本（含 temperature / max_tokens 透传、Bearer 头）
+  2. 错 Token 401
+  3. 无 Token 401
+  4. 不允许的模型 400
+  5. health 200 形状对
+  6. 管理端 setup → login → config 读到掩码不漏原值 → 改 model 生效
+     → 轮换 token 后旧 token 401、新 token 通
+  7. stats 有计数
+  8. 上游挂了 → 502
+  9. ai_enabled=false 时 chat 503（health 仍 200）
+  10. daily_limit 改成 2 后第 3 次 429
+
+全部通过退出 0，否则退出 1，并打印通过数。
+"""
+
+import http.client
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RELAY_PY = os.path.join(HERE, "relay.py")
+
+STUB_PORT = 18099
+RELAY_PORT = 18098
+APP_TOKEN = "test-app-token-abcdef"
+API_KEY = "sk-test-secret-key"
+ADMIN_PW = "admin123"
+
+STUB_STATE = {"last": None}
+HOLD = {"stub": None, "relay": None, "tmpdirs": []}
+STATE = {"app_token": APP_TOKEN, "cookie": None}
+RESULTS = []
+
+
+# ---------------- 桩上游 ----------------
+
+class StubHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            body = {}
+        STUB_STATE["last"] = {
+            "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "body": body,
+        }
+        resp = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "桩回复：你好"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        }
+        data = json.dumps(resp).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def start_stub():
+    srv = ThreadingHTTPServer(("127.0.0.1", STUB_PORT), StubHandler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def stop_stub(srv):
+    srv.shutdown()
+    srv.server_close()
+
+
+# ---------------- relay 子进程 ----------------
+
+def write_config(path, **overrides):
+    cfg = {
+        "provider": "zhipu",
+        "model": "test-model",
+        "base_url": "http://127.0.0.1:%d" % STUB_PORT,
+        "api_key": API_KEY,
+        "ai_enabled": True,
+        "app_token": APP_TOKEN,
+        "allowed_models": ["test-model", "other-model"],
+        "admin_password_hash": None,
+        "port": RELAY_PORT,
+        "daily_limit_per_ip": 200,
+    }
+    cfg.update(overrides)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(path, 0o600)
+
+
+class RelayProc:
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.proc = None
+
+    def start(self):
+        env = dict(os.environ)
+        env["RELAY_CONFIG"] = self.config_path
+        self.proc = subprocess.Popen(
+            [sys.executable, RELAY_PY], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                status, _, _, _ = http_get("/api/ai/health")
+                if status == 200:
+                    return
+            except Exception:
+                pass
+            if self.proc.poll() is not None:
+                out = self.proc.stdout.read() if self.proc.stdout else ""
+                raise RuntimeError("relay 提前退出：%s" % out)
+            time.sleep(0.2)
+        raise RuntimeError("relay 15 秒内未就绪")
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+
+
+# ---------------- HTTP 工具 ----------------
+
+def http_req(method, path, body=None, headers=None):
+    conn = http.client.HTTPConnection("127.0.0.1", RELAY_PORT, timeout=10)
+    hdrs = dict(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        hdrs.setdefault("Content-Type", "application/json")
+    conn.request(method, path, body=data, headers=hdrs)
+    resp = conn.getresponse()
+    raw = resp.read()
+    cookie = resp.getheader("Set-Cookie")
+    conn.close()
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        parsed = None
+    return resp.status, parsed, raw.decode("utf-8", "replace"), cookie
+
+
+def http_get(path, headers=None):
+    return http_req("GET", path, headers=headers)
+
+
+def chat(token=None, model=None, extra=None):
+    headers = {}
+    if token is not None:
+        headers["X-App-Token"] = token
+    body = {"messages": [{"role": "user", "content": "你好"}]}
+    if model is not None:
+        body["model"] = model
+    if extra:
+        body.update(extra)
+    return http_req("POST", "/api/ai/chat", body=body, headers=headers)
+
+
+def auth_headers():
+    return {"Cookie": STATE["cookie"]} if STATE["cookie"] else {}
+
+
+# ---------------- 测试用例 ----------------
+
+def test_chat_200():
+    STUB_STATE["last"] = None
+    status, data, raw, _ = chat(token=STATE["app_token"],
+                                extra={"temperature": 0.5, "max_tokens": 100})
+    assert status == 200, "期望 200，得到 %s：%s" % (status, raw)
+    assert data["choices"][0]["message"]["content"] == "桩回复：你好", "桩文本不对：%s" % raw
+    last = STUB_STATE["last"]
+    assert last is not None, "桩上游没收到请求"
+    assert last["path"] == "/chat/completions", "上游路径不对：%s" % last["path"]
+    assert last["auth"] == "Bearer " + API_KEY, "Authorization 头不对：%s" % last["auth"]
+    assert last["body"]["model"] == "test-model", "模型不对：%s" % last["body"]
+    assert last["body"]["temperature"] == 0.5, "temperature 未透传"
+    assert last["body"]["max_tokens"] == 100, "max_tokens 未透传"
+
+
+def test_wrong_token_401():
+    status, data, raw, _ = chat(token="wrong-token")
+    assert status == 401, "期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+
+
+def test_no_token_401():
+    status, data, raw, _ = chat(token=None)
+    assert status == 401, "期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+
+
+def test_bad_model_400():
+    status, data, raw, _ = chat(token=STATE["app_token"], model="gpt-4")
+    assert status == 400, "期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "model_not_allowed"}, "错误体不对：%s" % raw
+
+
+def test_health_shape():
+    status, data, raw, _ = http_get("/api/ai/health")
+    assert status == 200, "期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "provider": "zhipu",
+                    "model": "test-model", "ai_enabled": True}, "形状不对：%s" % raw
+
+
+def test_admin_flow():
+    # setup：成功后直接登录（发 Cookie）
+    status, data, raw, cookie = http_req(
+        "POST", "/api/admin/setup", body={"password": ADMIN_PW})
+    assert status == 200, "setup 期望 200，得到 %s：%s" % (status, raw)
+    assert cookie and "relay_session=" in cookie, "setup 未发会话 Cookie"
+    assert "HttpOnly" in cookie, "会话 Cookie 缺 HttpOnly"
+    STATE["cookie"] = cookie.split(";")[0]
+    # 已设密码后 setup 应 400
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/setup", body={"password": "other123"},
+        headers=auth_headers())
+    assert status == 400, "重复 setup 期望 400，得到 %s：%s" % (status, raw)
+    # config：掩码，不漏原值
+    status, data, raw, _ = http_req("GET", "/api/admin/config", headers=auth_headers())
+    assert status == 200, "config 期望 200，得到 %s：%s" % (status, raw)
+    assert API_KEY not in raw, "config 泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "config 泄露了 app_token 原值"
+    assert data["api_key_masked"] and data["api_key_masked"] != API_KEY
+    assert data["app_token_masked"] and data["app_token_masked"] != APP_TOKEN
+    # 未登录读 config → 401
+    status, _, raw, _ = http_req("GET", "/api/admin/config")
+    assert status == 401, "未登录 config 期望 401，得到 %s：%s" % (status, raw)
+    # 错密码登录 → 401
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/login", body={"password": "wrongpw"})
+    assert status == 401, "错密码登录期望 401，得到 %s：%s" % (status, raw)
+    # 对密码登录 → 200 + Cookie
+    status, _, raw, cookie2 = http_req(
+        "POST", "/api/admin/login", body={"password": ADMIN_PW})
+    assert status == 200, "登录期望 200，得到 %s：%s" % (status, raw)
+    assert cookie2 and "relay_session=" in cookie2, "登录未发会话 Cookie"
+    STATE["cookie"] = cookie2.split(";")[0]
+    # 改 model 生效
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/config", body={"model": "other-model"},
+        headers=auth_headers())
+    assert status == 200, "改 model 期望 200，得到 %s：%s" % (status, raw)
+    status, data, raw, _ = http_get("/api/ai/health")
+    assert data["model"] == "other-model", "改 model 未生效：%s" % raw
+    STUB_STATE["last"] = None
+    status, _, raw, _ = chat(token=STATE["app_token"])
+    assert status == 200, "改 model 后 chat 期望 200，得到 %s：%s" % (status, raw)
+    assert STUB_STATE["last"]["body"]["model"] == "other-model", "上游收到的模型不对"
+    # 轮换 token：旧 token 401，新 token 通
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/config", body={"rotate_app_token": True},
+        headers=auth_headers())
+    assert status == 200 and data.get("app_token"), "轮换应只返回一次新 token：%s" % raw
+    new_token = data["app_token"]
+    assert new_token != APP_TOKEN, "轮换后 token 没变"
+    status, _, raw, _ = chat(token=APP_TOKEN)
+    assert status == 401, "旧 token 期望 401，得到 %s：%s" % (status, raw)
+    status, _, raw, _ = chat(token=new_token)
+    assert status == 200, "新 token 期望 200，得到 %s：%s" % (status, raw)
+    STATE["app_token"] = new_token
+
+
+def test_stats():
+    status, data, raw, _ = http_req("GET", "/api/admin/stats", headers=auth_headers())
+    assert status == 200, "stats 期望 200，得到 %s：%s" % (status, raw)
+    assert data["total_calls"] >= 3, "stats 计数不对：%s" % raw
+    assert data["by_ip"].get("127.0.0.1", 0) >= 3, "stats 分 IP 不对：%s" % raw
+
+
+def test_upstream_down_502():
+    stop_stub(HOLD["stub"])
+    try:
+        status, data, raw, _ = chat(token=STATE["app_token"])
+        assert status == 502, "上游挂了期望 502，得到 %s：%s" % (status, raw)
+        assert data == {"error": "upstream_failed"}, "错误体不对：%s" % raw
+        assert API_KEY not in raw, "502 里泄露了 Key"
+    finally:
+        HOLD["stub"] = start_stub()
+        time.sleep(0.2)
+
+
+def test_ai_disabled_503():
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/config", body={"ai_enabled": False},
+        headers=auth_headers())
+    assert status == 200, "关 AI 期望 200，得到 %s：%s" % (status, raw)
+    status, data, raw, _ = chat(token=STATE["app_token"])
+    assert status == 503, "AI 关了期望 503，得到 %s：%s" % (status, raw)
+    assert data == {"error": "ai_disabled"}, "错误体不对：%s" % raw
+    status, data, raw, _ = http_get("/api/ai/health")
+    assert status == 200 and data["ai_enabled"] is False, "health 应仍 200 且 ai_enabled=false：%s" % raw
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/config", body={"ai_enabled": True},
+        headers=auth_headers())
+    assert status == 200, "恢复 AI 期望 200，得到 %s：%s" % (status, raw)
+
+
+def test_daily_limit_429():
+    # 换一份全新配置（daily_limit_per_ip=2，用量从 0 开始），重启 relay
+    HOLD["relay"].stop()
+    d2 = tempfile.mkdtemp(prefix="relay-test-limit-")
+    HOLD["tmpdirs"].append(d2)
+    cfg_path = os.path.join(d2, "config.json")
+    write_config(cfg_path, daily_limit_per_ip=2)
+    relay2 = RelayProc(cfg_path)
+    relay2.start()
+    HOLD["relay"] = relay2
+    s1, _, r1, _ = chat(token=APP_TOKEN)
+    assert s1 == 200, "第 1 次期望 200，得到 %s：%s" % (s1, r1)
+    s2, _, r2, _ = chat(token=APP_TOKEN)
+    assert s2 == 200, "第 2 次期望 200，得到 %s：%s" % (s2, r2)
+    s3, data, r3, _ = chat(token=APP_TOKEN)
+    assert s3 == 429, "第 3 次期望 429，得到 %s：%s" % (s3, r3)
+    assert data == {"error": "rate_limited"}, "错误体不对：%s" % r3
+
+
+TESTS = [
+    ("chat 200 返回桩文本", test_chat_200),
+    ("错 Token 401", test_wrong_token_401),
+    ("无 Token 401", test_no_token_401),
+    ("不允许的模型 400", test_bad_model_400),
+    ("health 200 形状对", test_health_shape),
+    ("管理端 setup→login→config→改 model→轮换 token", test_admin_flow),
+    ("stats 有计数", test_stats),
+    ("上游挂了 → 502", test_upstream_down_502),
+    ("ai_enabled=false 时 chat 503", test_ai_disabled_503),
+    ("daily_limit=2 时第 3 次 429", test_daily_limit_429),
+]
+
+
+# ---------------- 主流程 ----------------
+
+def ensure_port_free(port):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        print("端口 %d 已被占用，请先停掉占用它的进程" % port)
+        return False
+    finally:
+        s.close()
+    return True
+
+
+def check(name, fn):
+    try:
+        fn()
+    except Exception as e:
+        RESULTS.append((name, False, str(e)))
+        print("FAIL %s：%s" % (name, e))
+    else:
+        RESULTS.append((name, True, ""))
+        print("PASS %s" % name)
+
+
+def main():
+    if not ensure_port_free(STUB_PORT) or not ensure_port_free(RELAY_PORT):
+        return 2
+    tmpdir = tempfile.mkdtemp(prefix="relay-test-")
+    HOLD["tmpdirs"].append(tmpdir)
+    cfg_path = os.path.join(tmpdir, "config.json")
+    write_config(cfg_path)
+    HOLD["stub"] = start_stub()
+    relay = RelayProc(cfg_path)
+    HOLD["relay"] = relay
+    try:
+        relay.start()
+        for name, fn in TESTS:
+            check(name, fn)
+    finally:
+        try:
+            HOLD["relay"].stop()
+        except Exception:
+            pass
+        try:
+            stop_stub(HOLD["stub"])
+        except Exception:
+            pass
+        for d in HOLD["tmpdirs"]:
+            shutil.rmtree(d, ignore_errors=True)
+    passed = sum(1 for _, ok, _ in RESULTS if ok)
+    print("通过 %d/%d" % (passed, len(RESULTS)))
+    if passed != len(RESULTS):
+        for name, ok, err in RESULTS:
+            if not ok:
+                print("  未通过：%s（%s）" % (name, err))
+    return 0 if passed == len(RESULTS) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

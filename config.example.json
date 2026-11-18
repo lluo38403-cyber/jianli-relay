@@ -1,0 +1,1 @@
+{"admin_password_hash": null, "ai_enabled": true, "allowed_models": ["glm-4.7-flash", "glm-4-flash-250414"], "api_key": "", "app_token": "", "base_url": "https://open.bigmodel.cn/api/paas/v4", "daily_limit_per_ip": 200, "model": "glm-4.7-flash", "port": 8687, "provider": "zhipu"}
