@@ -301,6 +301,14 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <body>
 <h1>简历猎手 AI 中转 - 管理</h1>
 <p id="stats" class="hint"></p>
+<label>服务商（选一个，地址自动填好；Key 仍需自己贴）</label>
+<select id="providerPreset" style="width:100%;box-sizing:border-box;font-size:15px;padding:8px" onchange="applyPreset()">
+<option value="zhipu">智谱</option>
+<option value="deepseek">DeepSeek</option>
+<option value="qwen">通义千问</option>
+<option value="moonshot">月之暗面 Kimi</option>
+<option value="custom">自定义</option>
+</select>
 <label>服务商 provider</label>
 <input id="provider" type="text">
 <label>模型 model</label>
@@ -319,6 +327,7 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <label><input id="ai_enabled" type="checkbox"> 启用 AI（关掉后 exe 回落本地规则）</label>
 <label>允许的模型（逗号分隔）</label>
 <input id="allowed_models" type="text">
+<p class="hint">白名单，精确匹配。「模型」栏当前填的值必须一字不差地列在这里，否则 exe 的请求会被拒（model_not_allowed）。</p>
 <label>每 IP 每天限额（次）</label>
 <input id="daily_limit" type="text">
 <label>改管理员密码（留空表示不改，≥6 位）</label>
@@ -350,8 +359,31 @@ async function load(){
   document.getElementById('ai_enabled').checked=!!d.ai_enabled;
   document.getElementById('allowed_models').value=(d.allowed_models||[]).join(', ');
   document.getElementById('daily_limit').value=d.daily_limit_per_ip||'';
+  syncPreset();
   var s=await api('/api/admin/stats');
   if(s.ok){document.getElementById('stats').textContent='今天（'+s.data.date+'）调用 '+s.data.total_calls+' 次；分 IP：'+JSON.stringify(s.data.by_ip||{});}
+}
+var PRESETS={
+  zhipu:{provider:'zhipu',base_url:'https://open.bigmodel.cn/api/paas/v4'},
+  deepseek:{provider:'deepseek',base_url:'https://api.deepseek.com/v1'},
+  qwen:{provider:'qwen',base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1'},
+  moonshot:{provider:'moonshot',base_url:'https://api.moonshot.cn/v1'}
+};
+function applyPreset(){
+  var p=PRESETS[document.getElementById('providerPreset').value];
+  if(!p){return;} // 自定义：provider 与 Base URL 保持手填，不自动改
+  document.getElementById('provider').value=p.provider;
+  document.getElementById('base_url').value=p.base_url;
+}
+function syncPreset(){
+  // 按当前 provider / Base URL 反推下拉框应选哪项，对不上就选自定义
+  var pv=document.getElementById('provider').value.trim();
+  var bu=document.getElementById('base_url').value.trim().replace(/\/+$/,'');
+  var sel=document.getElementById('providerPreset');
+  sel.value='custom';
+  Object.keys(PRESETS).forEach(function(k){
+    if(PRESETS[k].provider===pv&&PRESETS[k].base_url===bu){sel.value=k;}
+  });
 }
 async function fetchModels(){
   var btn=document.getElementById('fetchModelsBtn');

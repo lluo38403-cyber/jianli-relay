@@ -20,6 +20,8 @@
   13. 草稿 Key 优先于已保存 Key（桩按 Key 返回不同列表）
   14. 上游 401 时拉模型 → 401
   15. 无 Key 时拉模型 → 400（换无 Key 配置重启 relay 再测）
+  16. 管理页含服务商预置下拉框（四家地址 + 自定义）与允许模型白名单说明
+     + pickModel 入口仍在
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -432,6 +434,22 @@ def test_models_no_key():
     assert data == {"error": "no_api_key"}, "错误体不对：%s" % raw
 
 
+def test_admin_page_presets():
+    # 登录后打开管理页：应含服务商预置下拉框 + 白名单说明 + pickModel 入口
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    for needle in [
+        'id="providerPreset"', 'applyPreset()', 'syncPreset()',
+        'https://open.bigmodel.cn/api/paas/v4',
+        'https://api.deepseek.com/v1',
+        'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        'https://api.moonshot.cn/v1',
+        '自定义', 'pickModel()', 'model_not_allowed',
+        '白名单，精确匹配',
+    ]:
+        assert needle in raw, "管理页缺预置内容：%s" % needle
+
+
 TESTS = [
     ("chat 200 返回桩文本", test_chat_200),
     ("错 Token 401", test_wrong_token_401),
@@ -448,6 +466,7 @@ TESTS = [
     ("ai_enabled=false 时 chat 503", test_ai_disabled_503),
     ("daily_limit=2 时第 3 次 429", test_daily_limit_429),
     ("无 Key 拉模型 400", test_models_no_key),
+    ("管理页含服务商预置下拉框与白名单说明", test_admin_page_presets),
 ]
 
 
