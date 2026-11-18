@@ -22,11 +22,17 @@
   15. 无 Key 时拉模型 → 400（换无 Key 配置重启 relay 再测）
   16. 管理页含服务商预置下拉框（四家地址 + 自定义）与允许模型白名单说明
      + pickModel 入口仍在
+  17. 自动更新：无发布时 /api/version 与 /download/latest 都是 404
+     → 未登录上传 401 → 无文件 400 → 版本格式不对 400
+     → 上传 1.0.1 后 version/dowload 对得上（sha256 与内容一致）
+     → 再传 1.0.2 覆盖旧版
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
 
+import hashlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -36,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -210,6 +217,53 @@ def http_req(method, path, body=None, headers=None):
 
 def http_get(path, headers=None):
     return http_req("GET", path, headers=headers)
+
+
+def http_req_raw(method, path, data, headers=None):
+    """发原始 bytes（multipart 上传 / 二进制下载用），返回
+    (status, parsed_json_or_None, raw_bytes, content_type)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", RELAY_PORT, timeout=30)
+    conn.request(method, path, body=data, headers=dict(headers or {}))
+    resp = conn.getresponse()
+    raw = resp.read()
+    ctype = resp.getheader("Content-Type")
+    conn.close()
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        parsed = None
+    return resp.status, parsed, raw, ctype
+
+
+def multipart_body(fields, files):
+    """拼 multipart/form-data：fields=[(name, value)]，
+    files=[(name, filename, content_bytes)]。返回 (body, content_type)。"""
+    boundary = "----relaytestboundary7d3f"
+    parts = []
+    for name, value in fields:
+        parts.append((
+            "--" + boundary + "\r\n"
+            'Content-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+            % (name, value)).encode("utf-8"))
+    for name, filename, content in files:
+        parts.append((
+            "--" + boundary + "\r\n"
+            'Content-Disposition: form-data; name="%s"; filename="%s"\r\n'
+            "Content-Type: application/zip\r\n\r\n"
+            % (name, filename)).encode("utf-8") + content + b"\r\n")
+    parts.append(("--" + boundary + "--\r\n").encode("utf-8"))
+    return b"".join(parts), "multipart/form-data; boundary=" + boundary
+
+
+def make_test_zip(marker):
+    """确定性小 zip：两次调用 marker 不同则内容不同。"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(zipfile.ZipInfo("a.txt", date_time=(2026, 1, 1, 0, 0, 0)),
+                   "hello-" + marker)
+        z.writestr(zipfile.ZipInfo("b/b.txt", date_time=(2026, 1, 1, 0, 0, 0)),
+                   "world-" + marker)
+    return buf.getvalue()
 
 
 def chat(token=None, model=None, extra=None):
@@ -450,6 +504,87 @@ def test_admin_page_presets():
         assert needle in raw, "管理页缺预置内容：%s" % needle
 
 
+def test_release_flow():
+    # 注意：此时 relay 是测试 15 重启后的无 Key 配置，app_token 是 APP_TOKEN，
+    # 管理员会话在 STATE["cookie"] 里。
+    token_hdr = {"X-App-Token": APP_TOKEN}
+    # 无发布时 version / download 都是 404
+    status, data, raw, _ = http_get("/api/version", headers=token_hdr)
+    assert status == 404, "无发布 version 期望 404，得到 %s：%s" % (status, raw)
+    assert data == {"error": "no_release"}, "错误体不对：%s" % raw
+    status, _, raw, _ = http_get("/api/version")
+    assert status == 401, "无 token version 期望 401，得到 %s：%s" % (status, raw)
+    status, _, raw, _ = http_get("/api/version", headers={"X-App-Token": "wrong"})
+    assert status == 401, "错 token version 期望 401，得到 %s：%s" % (status, raw)
+    status, data, raw, _ = http_get("/download/latest", headers=token_hdr)
+    assert status == 404, "无发布 download 期望 404，得到 %s：%s" % (status, raw)
+    assert data == {"error": "no_release"}, "错误体不对：%s" % raw
+    # 未登录上传 → 401
+    z1 = make_test_zip("one")
+    body, ctype = multipart_body([("version", "1.0.1")],
+                                 [("file", "pkg.zip", z1)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body, {"Content-Type": ctype})
+    assert status == 401, "未登录上传期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 只有 version 没有文件 → 400
+    body, ctype = multipart_body([("version", "1.0.1")], [])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, **auth_headers()})
+    assert status == 400, "无文件上传期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "no_file"}, "错误体不对：%s" % raw
+    # 版本格式不对 → 400
+    body, ctype = multipart_body([("version", "1.0")],
+                                 [("file", "pkg.zip", z1)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, **auth_headers()})
+    assert status == 400, "坏版本上传期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_version"}, "错误体不对：%s" % raw
+    # 正常上传 1.0.1
+    body, ctype = multipart_body([("version", "1.0.1"), ("notes", "第一版")],
+                                 [("file", "pkg.zip", z1)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, **auth_headers()})
+    assert status == 200, "上传 1.0.1 期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "version": "1.0.1"}, "返回体不对：%s" % raw
+    # version 对得上：版本号 / 大小 / sha256 / 说明
+    status, data, raw, _ = http_get("/api/version", headers=token_hdr)
+    assert status == 200, "上传后 version 期望 200，得到 %s：%s" % (status, raw)
+    assert data["version"] == "1.0.1", "版本号不对：%s" % raw
+    assert data["size"] == len(z1), "大小不对：%s" % raw
+    assert data["sha256"] == hashlib.sha256(z1).hexdigest(), "sha256 不对：%s" % raw
+    assert data["notes"] == "第一版", "说明不对：%s" % raw
+    # 下载内容与上传的字节完全一致
+    status, _, raw_bytes, ctype = http_req_raw(
+        "GET", "/download/latest", None, token_hdr)
+    assert status == 200, "下载期望 200，得到 %s" % status
+    assert ctype and ctype.startswith("application/zip"), "下载类型不对：%s" % ctype
+    assert raw_bytes == z1, "下载内容与上传不一致（%d vs %d 字节）" % (
+        len(raw_bytes), len(z1))
+    # 未带 token 下载 → 401
+    status, _, _, _ = http_req_raw("GET", "/download/latest", None, {})
+    assert status == 401, "无 token 下载期望 401，得到 %s" % status
+    # 再传 1.0.2 覆盖旧版
+    z2 = make_test_zip("two")
+    assert z2 != z1, "两个测试 zip 内容应不同"
+    body, ctype = multipart_body([("version", "1.0.2")],
+                                 [("file", "pkg.zip", z2)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, **auth_headers()})
+    assert status == 200 and data == {"ok": True, "version": "1.0.2"}, \
+        "覆盖上传期望 200，得到 %s：%s" % (status, raw)
+    status, data, raw, _ = http_get("/api/version", headers=token_hdr)
+    assert data["version"] == "1.0.2", "覆盖后版本号不对：%s" % raw
+    assert data["sha256"] == hashlib.sha256(z2).hexdigest(), "覆盖后 sha256 不对"
+    status, _, raw_bytes, _ = http_req_raw(
+        "GET", "/download/latest", None, token_hdr)
+    assert status == 200 and raw_bytes == z2, "覆盖后下载内容不对"
+
+
 TESTS = [
     ("chat 200 返回桩文本", test_chat_200),
     ("错 Token 401", test_wrong_token_401),
@@ -467,6 +602,7 @@ TESTS = [
     ("daily_limit=2 时第 3 次 429", test_daily_limit_429),
     ("无 Key 拉模型 400", test_models_no_key),
     ("管理页含服务商预置下拉框与白名单说明", test_admin_page_presets),
+    ("自动更新：上传发布 → version/download 核对", test_release_flow),
 ]
 
 

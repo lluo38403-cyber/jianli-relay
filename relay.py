@@ -7,6 +7,8 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
 接口：
   POST /api/ai/chat        聊天补全（需 X-App-Token 请求头）
   GET  /api/ai/health      健康检查
+  GET  /api/version        最新发布信息（需 X-App-Token 请求头；读 version.json）
+  GET  /download/latest    下载最新安装包（需 X-App-Token 请求头；流式发回）
   GET  /admin              管理页（设密码 / 登录 / 改配置）
   POST /api/admin/setup    首次设置管理员密码
   POST /api/admin/login    管理员登录
@@ -15,6 +17,12 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   POST /api/admin/config   改配置（立即写盘）
   GET  /api/admin/stats    当天调用统计
   POST /api/admin/models   拉模型列表（需管理员登录，草稿 Key 优先）
+  POST /api/admin/release  上传新版安装包（需管理员登录，multipart 表单）
+
+发布文件：安装包放配置目录下的 releases/latest.zip，
+版本信息放配置目录下的 version.json（{"version","size","sha256","notes"}）。
+deploy.sh 只下载 relay.py、config.example.json、jianli-relay.service、
+deploy.sh 四个文件，version.json 与 releases/ 不会被覆盖。
 
 配置：环境变量 RELAY_CONFIG，默认 /root/jianli-relay/config.json。
 日志只打 stdout，绝不记录 Key / Token / 密码原值。
@@ -24,6 +32,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -98,6 +107,148 @@ class Config:
 def config_snapshot():
     with CONFIG.lock:
         return dict(CONFIG.data)
+
+
+# ---------------- 发布（自动更新） ----------------
+# 安装包与版本信息放在配置目录旁，不进 config.json：
+#   releases/latest.zip   安装包（上传时覆盖旧的）
+#   version.json          {"version","size","sha256","notes"}
+# deploy.sh 只下载四个代码文件，绝不碰这两个路径。
+
+RELEASE_LOCK = threading.Lock()  # 上传串行化：同一时刻只处理一份安装包
+MAX_RELEASE_BYTES = 512 * 1024 * 1024  # 单个安装包上限 512MB，超了返回 413
+
+
+def release_dir():
+    """配置目录（生产上是 /root/jianli-relay，测试里是临时目录）。"""
+    return os.path.dirname(os.path.abspath(CONFIG.path))
+
+
+def read_release_info(rdir):
+    """读 version.json；不存在或格式不对返回 None（调用方当 no_release 处理）。"""
+    path = os.path.join(rdir, "version.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    version = info.get("version")
+    size = info.get("size")
+    sha256 = info.get("sha256")
+    notes = info.get("notes", "")
+    if not isinstance(version, str) or not version:
+        return None
+    if type(size) is not int or size < 0:
+        return None
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        return None
+    if not isinstance(notes, str):
+        notes = ""
+    return {"version": version, "size": size, "sha256": sha256, "notes": notes}
+
+
+def write_release_info(rdir, info):
+    """原子写 version.json（先写临时文件再替换，0600）。"""
+    path = os.path.join(rdir, "version.json")
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _parse_boundary(content_type):
+    """从 multipart Content-Type 里取 boundary（bytes），取不到返回 None。"""
+    if not content_type:
+        return None
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            b = part[len("boundary="):].strip().strip('"')
+            if b:
+                return b.encode("utf-8", "ignore")
+    return None
+
+
+class _BodyReader:
+    """按 Content-Length 精确读 body 的包装，支持 unread 回放。
+
+    _remaining = 还没从 socket 读出的字节数；_buf = 已读出但回放的字节。
+    read(n) 绝不超过剩余字节——keep-alive 连接上读超了会一直阻塞等
+    永远不会来的数据。"""
+
+    def __init__(self, rfile, length):
+        self._r = rfile
+        self._remaining = max(0, length)
+        self._buf = b""
+
+    def read(self, n):
+        if n <= 0:
+            return b""
+        out = b""
+        if self._buf:
+            out = self._buf[:n]
+            self._buf = self._buf[n:]
+            if len(out) >= n:
+                return out
+        want = n - len(out)
+        if want > 0 and self._remaining > 0:
+            chunk = self._r.read(min(want, self._remaining))
+            self._remaining -= len(chunk)
+            out += chunk
+        return out
+
+    def readline(self, limit=-1):
+        out = bytearray()
+        while True:
+            if self._buf:
+                idx = self._buf.find(b"\n")
+                if idx >= 0:
+                    end = idx + 1
+                    if limit >= 0:
+                        end = min(end, limit - len(out))
+                    if end <= 0:
+                        return bytes(out)
+                    out += self._buf[:end]
+                    self._buf = self._buf[end:]
+                    return bytes(out)
+                if limit >= 0:
+                    take = min(len(self._buf), limit - len(out))
+                    out += self._buf[:take]
+                    self._buf = self._buf[take:]
+                    if len(out) >= limit:
+                        return bytes(out)
+                else:
+                    out += self._buf
+                    self._buf = b""
+            if self._remaining <= 0:
+                return bytes(out)
+            want = 8192
+            if limit >= 0:
+                want = min(want, limit - len(out))
+                if want <= 0:
+                    return bytes(out)
+            chunk = self._r.read(min(want, self._remaining))
+            if not chunk:
+                return bytes(out)
+            self._remaining -= len(chunk)
+            self._buf = chunk
+
+    def unread(self, data):
+        if data:
+            self._buf = data + self._buf
+
+    def drain(self):
+        """丢弃 body 剩余部分（解析失败后保持连接干净）。"""
+        while self._remaining > 0:
+            chunk = self._r.read(min(65536, self._remaining))
+            if not chunk:
+                break
+            self._remaining -= len(chunk)
+        self._buf = b""
 
 
 # ---------------- 每日用量 ----------------
@@ -517,8 +668,11 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length > 0:
-            self.rfile.read(length)
+        while length > 0:
+            chunk = self.rfile.read(min(65536, length))
+            if not chunk:
+                break
+            length -= len(chunk)
 
     def session_token(self):
         cookie = self.headers.get("Cookie") or ""
@@ -547,6 +701,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         elif path == "/api/ai/health":
             self.handle_health()
+        elif path == "/api/version":
+            self.handle_version()
+        elif path == "/download/latest":
+            self.handle_download_latest()
         elif path == "/admin":
             self.handle_admin_page()
         elif path == "/api/admin/config":
@@ -570,6 +728,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_admin_config_post()
         elif path == "/api/admin/models":
             self.handle_admin_models()
+        elif path == "/api/admin/release":
+            self.handle_admin_release()
         else:
             self.drain_body()
             self.send_json(404, {"error": "not_found"})
@@ -583,6 +743,51 @@ class Handler(BaseHTTPRequestHandler):
             "model": cfg["model"],
             "ai_enabled": cfg["ai_enabled"],
         })
+
+    # ---- 自动更新：版本与下载 ----
+    def _check_app_token(self):
+        """和 /api/ai/chat 同样的鉴权：X-App-Token 对不上返回 401。"""
+        cfg = config_snapshot()
+        token = self.headers.get("X-App-Token")
+        if not token or not hmac.compare_digest(token, cfg.get("app_token") or ""):
+            self.send_json(401, {"error": "unauthorized"})
+            return None
+        return cfg
+
+    def handle_version(self):
+        if self._check_app_token() is None:
+            return
+        info = read_release_info(release_dir())
+        if info is None:
+            return self.send_json(404, {"error": "no_release"})
+        self.send_json(200, info)
+
+    def handle_download_latest(self):
+        if self._check_app_token() is None:
+            return
+        path = os.path.join(release_dir(), "releases", "latest.zip")
+        if not os.path.isfile(path):
+            return self.send_json(404, {"error": "no_release"})
+        try:
+            size = os.path.getsize(path)
+            f = open(path, "rb")
+        except OSError:
+            return self.send_json(404, {"error": "no_release"})
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", 'attachment; filename="latest.zip"')
+            self.end_headers()
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            f.close()
 
     def handle_chat(self):
         cfg = config_snapshot()
@@ -810,6 +1015,191 @@ class Handler(BaseHTTPRequestHandler):
             "total_calls": sum(counts.values()),
             "by_ip": counts,
         })
+
+    # ---- 自动更新：上传新版（管理员） ----
+    def handle_admin_release(self):
+        if not self.require_login():
+            return
+        ctype = self.headers.get("Content-Type") or ""
+        if "multipart/form-data" not in ctype:
+            self.drain_body()
+            return self.send_json(400, {"error": "invalid_content_type"})
+        boundary = _parse_boundary(ctype)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not boundary or length <= 0:
+            self.drain_body()
+            return self.send_json(400, {"error": "invalid_request"})
+        if length > MAX_RELEASE_BYTES:
+            self.drain_body()
+            return self.send_json(413, {"error": "too_large"})
+        with RELEASE_LOCK:
+            self._do_release(length, boundary)
+
+    def _do_release(self, length, boundary):
+        rdir = release_dir()
+        rel_dir = os.path.join(rdir, "releases")
+        os.makedirs(rel_dir, exist_ok=True)
+        tmp_path = os.path.join(rel_dir, "latest.zip.tmp")
+        reader = _BodyReader(self.rfile, length)
+        try:
+            fields, file_info = self._parse_multipart(reader, boundary, tmp_path)
+        except ValueError as e:
+            reader.drain()
+            self._cleanup_tmp(tmp_path)
+            log("release upload failed: %s" % e)
+            return self.send_json(400, {"error": "invalid_multipart"})
+        reader.drain()  # 丢弃最终边界后的 epilogue，保持连接干净
+        if file_info is None:
+            self._cleanup_tmp(tmp_path)
+            return self.send_json(400, {"error": "no_file"})
+        _filename, size, sha256 = file_info
+        if size <= 0:
+            self._cleanup_tmp(tmp_path)
+            return self.send_json(400, {"error": "no_file"})
+        version = (fields.get("version") or "").strip()
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            self._cleanup_tmp(tmp_path)
+            return self.send_json(400, {"error": "invalid_version"})
+        notes = fields.get("notes", "")
+        final_path = os.path.join(rel_dir, "latest.zip")
+        os.replace(tmp_path, final_path)
+        info = {"version": version, "size": size, "sha256": sha256, "notes": notes}
+        write_release_info(rdir, info)
+        log("release published: version=%s size=%d" % (version, size))
+        self.send_json(200, {"ok": True, "version": version})
+
+    @staticmethod
+    def _cleanup_tmp(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    def _parse_multipart(self, reader, boundary, tmp_path):
+        """流式解析 multipart/form-data。
+
+        返回 (fields, file_info)：fields 是 {name: str}，file_info 是
+        (filename, size, sha256_hex) 或 None（没有文件 part 时）。
+        文件体边读边写临时文件、边算 sha256，不进内存；文本字段单个超 1MB 报错。
+        出错 raise ValueError，调用方负责清理临时文件。"""
+        delim = b"--" + boundary
+        # 首行应为 boundary，之前只允许空行（preamble）
+        for _ in range(10):
+            line = reader.readline(65536)
+            if not line:
+                raise ValueError("bad preamble")
+            if line.rstrip(b"\r\n") == delim:
+                break
+            if line.strip() != b"":
+                raise ValueError("bad preamble")
+        else:
+            raise ValueError("bad preamble")
+        fields = {}
+        file_info = None
+        while True:
+            headers = {}
+            while True:
+                line = reader.readline(65536)
+                if not line:
+                    raise ValueError("truncated headers")
+                line = line.rstrip(b"\r\n")
+                if line == b"":
+                    break
+                if b":" not in line:
+                    raise ValueError("bad header line")
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
+            cd = headers.get("content-disposition", "")
+            name = None
+            filename = None
+            for part in cd.split(";"):
+                part = part.strip()
+                if part.startswith("name="):
+                    name = part[5:].strip().strip('"')
+                elif part.startswith("filename="):
+                    filename = part[9:].strip().strip('"')
+            if name is None:
+                raise ValueError("part without name")
+            final, info = self._read_part_body(reader, delim, name, filename,
+                                               fields, tmp_path)
+            if info is not None:
+                file_info = info
+            if final:
+                break
+        return fields, file_info
+
+    def _read_part_body(self, reader, delim, name, filename, fields, tmp_path):
+        """读一个 part 的 body，直到下一个 boundary。
+        返回 (是否最终边界, file_info 或 None)。"""
+        needle = b"\r\n" + delim
+        tail = b""
+        if filename is not None:
+            h = hashlib.sha256()
+            size = 0
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = reader.read(65536)
+                    if not chunk:
+                        raise ValueError("truncated body")
+                    data = tail + chunk
+                    idx = data.find(needle)
+                    if idx >= 0:
+                        out.write(data[:idx])
+                        h.update(data[:idx])
+                        size += idx
+                        final = self._delim_tail(reader, data[idx + len(needle):])
+                        break
+                    keep = len(delim) + 2  # 尾巴里可能藏着半个 boundary
+                    if len(data) > keep:
+                        out.write(data[:-keep])
+                        h.update(data[:-keep])
+                        size += len(data) - keep
+                        tail = data[-keep:]
+                    else:
+                        tail = data
+            return final, (filename, size, h.hexdigest())
+        buf = bytearray()
+        while True:
+            chunk = reader.read(65536)
+            if not chunk:
+                raise ValueError("truncated body")
+            data = tail + chunk
+            idx = data.find(needle)
+            if idx >= 0:
+                buf += data[:idx]
+                final = self._delim_tail(reader, data[idx + len(needle):])
+                break
+            keep = len(delim) + 2
+            if len(data) > keep:
+                buf += data[:-keep]
+                tail = data[-keep:]
+            else:
+                tail = data
+            if len(buf) > 1024 * 1024:
+                raise ValueError("field too large")
+        fields[name] = bytes(buf).decode("utf-8", "replace")
+        return final, None
+
+    @staticmethod
+    def _delim_tail(reader, rest):
+        """boundary 后面的收尾：b"--" 是最终边界，b"\r\n" 是还有后续 part。
+        rest 里多出的字节（下个 part 的开头）要回放，绝不能丢。"""
+        buf = rest
+        while len(buf) < 2:
+            more = reader.read(2 - len(buf))
+            if not more:
+                raise ValueError("truncated boundary")
+            buf += more
+        if buf[:2] == b"--":
+            return True
+        if buf[:2] == b"\r\n":
+            if len(buf) > 2:
+                reader.unread(buf[2:])
+            return False
+        raise ValueError("bad boundary tail")
 
 
 # ---------------- 启动 ----------------
