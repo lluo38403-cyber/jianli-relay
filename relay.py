@@ -14,6 +14,7 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   GET  /api/admin/config   读配置（掩码，绝不返回原值）
   POST /api/admin/config   改配置（立即写盘）
   GET  /api/admin/stats    当天调用统计
+  POST /api/admin/models   拉模型列表（需管理员登录，草稿 Key 优先）
 
 配置：环境变量 RELAY_CONFIG，默认 /root/jianli-relay/config.json。
 日志只打 stdout，绝不记录 Key / Token / 密码原值。
@@ -304,6 +305,11 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="provider" type="text">
 <label>模型 model</label>
 <input id="model" type="text">
+<div>
+<button id="fetchModelsBtn" onclick="fetchModels()">获取模型列表</button>
+<select id="modelSelect" style="display:none;font-size:15px;padding:8px;margin:8px 8px 0 0" onchange="pickModel()"></select>
+</div>
+<p id="modelsMsg" class="hint"></p>
 <label>Base URL</label>
 <input id="base_url" type="text">
 <label>服务商 Key（留空表示沿用）</label>
@@ -346,6 +352,45 @@ async function load(){
   document.getElementById('daily_limit').value=d.daily_limit_per_ip||'';
   var s=await api('/api/admin/stats');
   if(s.ok){document.getElementById('stats').textContent='今天（'+s.data.date+'）调用 '+s.data.total_calls+' 次；分 IP：'+JSON.stringify(s.data.by_ip||{});}
+}
+async function fetchModels(){
+  var btn=document.getElementById('fetchModelsBtn');
+  var sel=document.getElementById('modelSelect');
+  var msg=document.getElementById('modelsMsg');
+  btn.disabled=true;
+  btn.textContent='拉取中…';
+  msg.textContent='';
+  var r=await api('/api/admin/models','POST',{
+    base_url:document.getElementById('base_url').value.trim(),
+    api_key:document.getElementById('api_key').value
+  });
+  btn.disabled=false;
+  btn.textContent='获取模型列表';
+  if(!r.ok||!Array.isArray(r.data.models)){
+    if(r.status===401){msg.textContent='拉取失败：Key 无效或地址不对';}
+    else if(r.status===400){msg.textContent='拉取失败：请先填写服务商 Key';}
+    else{msg.textContent='拉取失败：服务商地址不对或网络不通';}
+    return;
+  }
+  var models=r.data.models;
+  sel.innerHTML='';
+  var ph=document.createElement('option');
+  ph.value=''; ph.textContent='请选择模型…'; sel.appendChild(ph);
+  models.forEach(function(m){
+    var o=document.createElement('option');
+    o.value=m; o.textContent=m; sel.appendChild(o);
+  });
+  sel.style.display=models.length?'':'none';
+  msg.textContent=models.length?('已拉到 '+models.length+' 个模型，选一个填入后点「保存」生效。'):'拉取成功，但该服务商没有返回模型。';
+}
+function pickModel(){
+  var sel=document.getElementById('modelSelect');
+  var v=sel.value;
+  if(!v){return;}
+  document.getElementById('model').value=v;
+  var am=document.getElementById('allowed_models').value.split(',').map(function(x){return x.trim();}).filter(Boolean);
+  if(am.indexOf(v)===-1){am.push(v);document.getElementById('allowed_models').value=am.join(', ');}
+  document.getElementById('modelsMsg').textContent='已选 '+v+'，点「保存」生效。';
 }
 async function save(){
   var body={
@@ -491,6 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_logout()
         elif path == "/api/admin/config":
             self.handle_admin_config_post()
+        elif path == "/api/admin/models":
+            self.handle_admin_models()
         else:
             self.drain_body()
             self.send_json(404, {"error": "not_found"})
@@ -579,6 +626,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(200, PAGE_CONFIG)
 
     # ---- /api/admin ----
+    def handle_admin_models(self):
+        """拉模型列表：GET {base_url}/models，草稿 base_url / api_key 优先于已保存配置。"""
+        if not self.require_login():
+            return
+        body = self.read_json_body() or {}
+        cfg = config_snapshot()
+        base_url = cfg["base_url"]
+        if isinstance(body.get("base_url"), str) and body["base_url"].strip():
+            base_url = body["base_url"].strip()
+        api_key = cfg.get("api_key")
+        if isinstance(body.get("api_key"), str) and body["api_key"]:
+            api_key = body["api_key"]
+        if not api_key:
+            return self.send_json(400, {"error": "no_api_key"})
+        url = (base_url or "").rstrip("/") + "/models"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", "Bearer " + api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return self.send_json(401, {"error": "upstream_unauthorized"})
+            log("models upstream HTTP %s" % e.code)
+            return self.send_json(502, {"error": "upstream_failed"})
+        except Exception as e:
+            log("models upstream error: %s" % type(e).__name__)
+            return self.send_json(502, {"error": "upstream_failed"})
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            items = payload.get("data")
+            if not isinstance(items, list):
+                raise ValueError("bad models payload")
+            ids = sorted({it["id"] for it in items
+                          if isinstance(it, dict) and isinstance(it.get("id"), str) and it["id"]})
+        except Exception:
+            return self.send_json(502, {"error": "upstream_failed"})
+        self.send_json(200, {"models": ids})
+
     def handle_setup(self):
         body = self.read_json_body()
         if body is None:

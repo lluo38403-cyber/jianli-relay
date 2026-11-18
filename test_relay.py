@@ -15,6 +15,11 @@
   8. 上游挂了 → 502
   9. ai_enabled=false 时 chat 503（health 仍 200）
   10. daily_limit 改成 2 后第 3 次 429
+  11. 拉模型列表：桩返回未排序含重复的 id → 返回去重排序后的列表
+  12. 未登录拉模型 → 401
+  13. 草稿 Key 优先于已保存 Key（桩按 Key 返回不同列表）
+  14. 上游 401 时拉模型 → 401
+  15. 无 Key 时拉模型 → 400（换无 Key 配置重启 relay 再测）
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -80,6 +85,36 @@ class StubHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def do_GET(self):
+        # 桩模型列表：按 Authorization 里的 Key 返回不同列表（验草稿 Key 优先）
+        if self.path == "/models":
+            auth = self.headers.get("Authorization")
+            if auth == "Bearer sk-bad-key":
+                data = json.dumps(
+                    {"error": {"message": "Incorrect API key"}}).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if auth == "Bearer sk-draft-key":
+                names = ["z-draft-model", "a-draft-model", "m-draft-model"]
+            else:
+                names = ["zebra-model", "apple-model", "mango-model", "apple-model"]
+            data = json.dumps(
+                {"object": "list",
+                 "data": [{"id": n, "object": "model"} for n in names]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
 def start_stub():
@@ -345,6 +380,58 @@ def test_daily_limit_429():
     assert data == {"error": "rate_limited"}, "错误体不对：%s" % r3
 
 
+def test_models_list():
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/models", body={}, headers=auth_headers())
+    assert status == 200, "拉模型期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"models": ["apple-model", "mango-model", "zebra-model"]}, \
+        "模型列表不对（应去重排序）：%s" % raw
+    assert API_KEY not in raw, "拉模型泄露了 Key"
+
+
+def test_models_unauth():
+    status, data, raw, _ = http_req("POST", "/api/admin/models", body={})
+    assert status == 401, "未登录拉模型期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+
+
+def test_models_draft_priority():
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/models", body={"api_key": "sk-draft-key"},
+        headers=auth_headers())
+    assert status == 200, "草稿 Key 拉模型期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"models": ["a-draft-model", "m-draft-model", "z-draft-model"]}, \
+        "草稿 Key 未优先（应返回草稿 Key 对应的列表）：%s" % raw
+
+
+def test_models_upstream_401():
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/models", body={"api_key": "sk-bad-key"},
+        headers=auth_headers())
+    assert status == 401, "上游 401 期望 401，得到 %s：%s" % (status, raw)
+    assert "sk-bad-key" not in raw, "401 里泄露了 Key"
+
+
+def test_models_no_key():
+    # 换一份无 Key 的配置重启 relay，重新 setup + 登录
+    HOLD["relay"].stop()
+    d3 = tempfile.mkdtemp(prefix="relay-test-nokey-")
+    HOLD["tmpdirs"].append(d3)
+    cfg_path = os.path.join(d3, "config.json")
+    write_config(cfg_path, api_key="")
+    relay3 = RelayProc(cfg_path)
+    relay3.start()
+    HOLD["relay"] = relay3
+    status, _, raw, cookie = http_req(
+        "POST", "/api/admin/setup", body={"password": ADMIN_PW})
+    assert status == 200, "无 Key 配置下 setup 期望 200，得到 %s：%s" % (status, raw)
+    STATE["cookie"] = cookie.split(";")[0]
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/models", body={}, headers=auth_headers())
+    assert status == 400, "无 Key 拉模型期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "no_api_key"}, "错误体不对：%s" % raw
+
+
 TESTS = [
     ("chat 200 返回桩文本", test_chat_200),
     ("错 Token 401", test_wrong_token_401),
@@ -353,9 +440,14 @@ TESTS = [
     ("health 200 形状对", test_health_shape),
     ("管理端 setup→login→config→改 model→轮换 token", test_admin_flow),
     ("stats 有计数", test_stats),
+    ("拉模型列表去重排序", test_models_list),
+    ("未登录拉模型 401", test_models_unauth),
+    ("草稿 Key 优先拉模型", test_models_draft_priority),
+    ("上游 401 时拉模型 401", test_models_upstream_401),
     ("上游挂了 → 502", test_upstream_down_502),
     ("ai_enabled=false 时 chat 503", test_ai_disabled_503),
     ("daily_limit=2 时第 3 次 429", test_daily_limit_429),
+    ("无 Key 拉模型 400", test_models_no_key),
 ]
 
 
