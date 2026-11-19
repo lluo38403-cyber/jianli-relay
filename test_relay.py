@@ -47,6 +47,11 @@
   29. 管理页含万能卡区：密码框 + 保存按钮 + 使用记录入口，且不漏卡值
   30. 管理页移动端重排版：标题「管理面板」+ 复制全部 + 逐行复制标记，
       卡密表与万能卡记录表已换成纵向列表，且页面 HTML 里不含卡密值
+  31. 卡密管理升级：生成带 batch_id、列表按状态/类型/批次/关键词筛选
+      （含总数与各状态计数、批次列表）、90 天未用算已过期、单删与按条件删、
+      已用卡默认拦截（confirm_used 才删）、删除接口也要登录；
+      管理页含搜索筛选、折叠列表、回顶到底、批量操作栏与二次确认
+  32. 管理页与登录页内嵌 JS 能过 node --check（防 '\n' 被 Python 吃掉）
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -556,6 +561,156 @@ def test_admin_cards_generate_list():
     assert status == 401, "未登录读卡密列表期望 401，得到 %s" % status
 
 
+def _cards_list(params=None):
+    path = "/api/admin/cards"
+    if params:
+        path += "?" + "&".join("%s=%s" % (k, v) for k, v in params.items())
+    status, data, raw, _ = http_req("GET", path, headers=auth_headers())
+    assert status == 200, "卡密列表期望 200，得到 %s：%s" % (status, raw)
+    return data
+
+
+def test_admin_cards_filter_delete():
+    # 生成两批：天卡 x2（批 A）、周卡 x1（批 B）；生成响应应带 batch_id
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/generate",
+        body={"type": "day", "count": 2}, headers=auth_headers())
+    assert status == 200, "生成批 A 期望 200，得到 %s：%s" % (status, raw)
+    codes_a = data["codes"]
+    batch_a = data.get("batch_id")
+    assert re.fullmatch(r"B\d{14}[A-HJKMNP-Z2-9]{2}", batch_a or ""), "批 A 应有 batch_id：%s" % raw
+    codes_b = _gen_cards("week", 1)
+    batch_b = _cards_list({"q": codes_b[0]})["cards"][0]["batch_id"]
+    assert re.fullmatch(r"B\d{14}[A-HJKMNP-Z2-9]{2}", batch_b or ""), "批 B 应有 batch_id"
+    assert batch_a != batch_b, "两批 batch_id 应不同：%s / %s" % (batch_a, batch_b)
+    # 批次筛选：latest 只有批 B；指定批 A 只有两张天卡
+    got = _cards_list({"batch": "latest"})
+    assert [c["code"] for c in got["cards"]] == codes_b, "latest 应只有批 B：%s" % got
+    got = _cards_list({"batch": batch_a})
+    assert sorted(c["code"] for c in got["cards"]) == sorted(codes_a), "批 A 应为两张天卡"
+    assert got["total"] == 2, "批 A 总数应为 2：%s" % got
+    # 类型与状态筛选
+    got = _cards_list({"batch": batch_a, "type": "week"})
+    assert got["total"] == 0, "批 A 里不应有周卡"
+    got = _cards_list({"batch": batch_a, "status": "unused"})
+    assert got["total"] == 2, "批 A 两张都应未用"
+    # 关键词搜索：整码命中 1 张；小写 jl-d 命中天卡；机器码片段命中已用卡
+    got = _cards_list({"q": codes_a[0]})
+    assert got["total"] == 1 and got["cards"][0]["code"] == codes_a[0], "整码搜索应命中 1 张"
+    got = _cards_list({"q": "jl-d"})
+    assert got["total"] >= 2, "小写 jl-d 应命中天卡"
+    day_code = AUTH_STATE["day_code"]
+    got = _cards_list({"q": MACHINE_A[:12]})
+    assert day_code in [c["code"] for c in got["cards"]], "机器码片段应命中已用天卡"
+    # 计数与批次列表
+    got = _cards_list({"batch": batch_a})
+    assert got["counts"]["unused"] == 2, "批 A 计数未用应为 2：%s" % got["counts"]
+    assert any(b["batch_id"] == batch_a and b["count"] == 2 for b in got["batches"]), \
+        "批次列表应含批 A 且 count=2：%s" % got["batches"]
+    # 已过期：把批 A 第一张的创建时间改到 91 天前（直接改卡库文件，
+    # 找 HOLD 里实际存在 auth_cards.json 的那个临时目录）
+    store_path = None
+    for d in HOLD["tmpdirs"]:
+        cand = os.path.join(d, "auth_cards.json")
+        if os.path.exists(cand):
+            store_path = cand
+            break
+    assert store_path, "找不到 auth_cards.json，tmpdirs=%s" % (HOLD["tmpdirs"],)
+    with open(store_path, "r", encoding="utf-8") as f:
+        store = json.load(f)
+    store[codes_a[0]]["created_at"] = int(time.time()) - 91 * 86400
+    with open(store_path, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    got = _cards_list({"status": "expired"})
+    assert codes_a[0] in [c["code"] for c in got["cards"]], "改到 91 天前应算已过期"
+    got = _cards_list({"batch": batch_a, "status": "unused"})
+    assert [c["code"] for c in got["cards"]] == [codes_a[1]], "批 A 未用只剩第二张"
+    # 按筛选条件删：只删批 A 里已过期的那张
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"filter": {"batch": batch_a, "status": "expired"}},
+        headers=auth_headers())
+    assert status == 200, "按条件删过期卡期望 200，得到 %s：%s" % (status, raw)
+    assert data["deleted"] == [codes_a[0]], "应只删过期那张：%s" % data
+    got = _cards_list({"batch": batch_a})
+    assert got["total"] == 1, "批 A 删后应剩 1 张"
+    # 按卡号删：未用卡直接删；不存在的码进 not_found
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"codes": [codes_a[1], "JL-D-AAAA-AAAA-AAAA"]},
+        headers=auth_headers())
+    assert status == 200, "按卡号删期望 200，得到 %s：%s" % (status, raw)
+    assert data["deleted"] == [codes_a[1]], "应删第二张：%s" % data
+    assert data["not_found"] == ["JL-D-AAAA-AAAA-AAAA"], "不存在的码应进 not_found"
+    # 已用卡保护：新生成一张天卡并激活，再删
+    used_code = _gen_cards("day", 1)[0]
+    status, data, raw, _ = auth_activate(MACHINE_B, used_code)
+    assert status == 200, "激活新卡期望 200，得到 %s：%s" % (status, raw)
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"codes": [used_code]}, headers=auth_headers())
+    assert status == 400, "删已用卡不带确认期望 400，得到 %s：%s" % (status, raw)
+    assert data["error"] == "has_used" and data["used_count"] == 1, "应报 has_used：%s" % data
+    assert used_code in [c["code"] for c in _cards_list()["cards"]], "拦截后卡应还在"
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"codes": [used_code], "confirm_used": True}, headers=auth_headers())
+    assert status == 200 and data["deleted"] == [used_code], "带确认应删掉已用卡：%s" % data
+    # 按筛选条件删含已用卡：同样先拦、确认后删
+    codes_c = _gen_cards("day", 2)
+    batch_c = _cards_list({"q": codes_c[0]})["cards"][0]["batch_id"]
+    status, _, raw, _ = auth_activate(MACHINE_B, codes_c[0])
+    assert status == 200, "激活批 C 第一张期望 200：%s" % raw
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"filter": {"batch": batch_c}}, headers=auth_headers())
+    assert status == 400 and data["error"] == "has_used", "按条件删含已用卡应拦：%s" % data
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"filter": {"batch": batch_c}, "confirm_used": True},
+        headers=auth_headers())
+    assert status == 200 and data["deleted_count"] == 2, "确认后应删批 C 两张：%s" % data
+    assert _cards_list({"batch": batch_c})["total"] == 0, "批 C 应删空"
+    # 参数校验与鉴权
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete",
+        body={"codes": [codes_b[0]], "filter": {"status": "unused"}},
+        headers=auth_headers())
+    assert status == 400 and data["error"] == "ambiguous", "两者同给应 400 ambiguous"
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete", body={}, headers=auth_headers())
+    assert status == 400 and data["error"] == "invalid_request", "空请求应 400"
+    status, _, raw, _ = http_req(
+        "GET", "/api/admin/cards?status=bogus", headers=auth_headers())
+    assert status == 400, "坏 status 应 400，得到 %s" % status
+    status, _, raw, _ = http_req(
+        "GET", "/api/admin/cards?limit=0", headers=auth_headers())
+    assert status == 400, "limit=0 应 400，得到 %s" % status
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/cards/delete", body={"codes": [codes_b[0]]})
+    assert status == 401, "未登录删卡期望 401，得到 %s" % status
+
+
+def test_admin_page_js_syntax():
+    # 管理页与登录页内嵌的 <script> 必须能通过 node --check（防 Python 三引号
+    # 把 JS 里的 '\n' 吃成真换行：2026-11-19 卡密升级就栽过一次，接口测试全过
+    # 但页面脚本直接报 SyntaxError、卡密列表一行都出不来）
+    node = shutil.which("node")
+    if not node:
+        return  # 没装 node 的环境跳过
+    for label, headers in (("管理页", auth_headers()), ("登录页", {})):
+        status, _, raw, _ = http_req("GET", "/admin", headers=headers)
+        assert status == 200, "%s期望 200，得到 %s" % (label, status)
+        m = re.search(r"<script>(.*)</script>", raw, re.S)
+        assert m, "%s缺 script 块" % label
+        path = os.path.join(tempfile.mkdtemp(prefix="relay-jscheck-"), "page.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(m.group(1))
+        r = subprocess.run([node, "--check", path],
+                           capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, "%s JS 语法错误：%s" % (label, r.stderr)
+
+
 def test_admin_machines_extend():
     # 给已有机器延长 3600 秒：剩余增加约 3600
     status, data, raw, _ = auth_info(MACHINE_A)
@@ -845,8 +1000,11 @@ def test_admin_page_mobile_layout():
     assert status == 200, "管理页期望 200，得到 %s" % status
     assert "<title>管理面板</title>" in raw, "管理页标题应为管理面板"
     assert "<h1>管理面板</h1>" in raw, "管理页 h1 应为管理面板"
-    for needle in ["复制全部", "copyText(", "data-code",
-                   "copyAllCards(", "copyNewAll("]:
+    for needle in ["复制全部", "copyText(", "copyNewAll(",
+                   "复制当前筛选结果", "copyFiltered(", "deleteFiltered(",
+                   'id="cardSearch"', 'id="cardStatus"', 'id="cardLatest"',
+                   "展开全部", "回顶", "到底", 'id="batchBar"',
+                   'id="confirmModal"', "仅看最新批次", "删除当前筛选结果"]:
         assert needle in raw, "管理页缺移动端复制内容：%s" % needle
     assert "<table" not in raw, "管理页不应再含 table 布局"
     for code in codes:
@@ -1284,6 +1442,8 @@ TESTS = [
     ("鉴权 activate 错误：重复用 / 绑定他人 / 不存在的码", test_auth_activate_used_and_bound),
     ("鉴权 activate 签名错误：错签名 400 / 过期时间戳 400 / 失败不耗卡", test_auth_activate_sig_errors),
     ("管理员卡密：生成与列表", test_admin_cards_generate_list),
+    ("管理员卡密：批次/筛选/搜索/删除保护", test_admin_cards_filter_delete),
+    ("管理页内嵌 JS 语法（node --check）", test_admin_page_js_syntax),
     ("管理员机器延长：已有叠加 / 新建 / 校验", test_admin_machines_extend),
     ("管理页含卡密管理区", test_admin_page_auth_section),
     ("万能卡：设/清 / 激活 10 年 / 叠加重复用 / 不限机器 / 使用记录 / 未设置失效 / 不漏卡值", test_master_card_flow),

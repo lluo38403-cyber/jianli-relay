@@ -100,19 +100,40 @@
 
 ### POST /api/admin/cards/generate —— 生成卡密
 
-请求：`{"type": "day"|"week", "count": 1..100}`；响应 200：`{"codes": ["JL-D-…", …]}`。
+请求：`{"type": "day"|"week", "count": 1..100}`；
+响应 200：`{"codes": ["JL-D-…", …], "batch_id": "B20261119123045XK"}`。
+同一次调用生成的卡共享一个 `batch_id`（B + 生成时刻 UTC + 2 位随机码，防同秒碰撞），供“仅看最新批次”筛选。
+“最新批次”按库内单调递增的批次序号判定，不靠秒级时间戳（同秒连点两次生成也不会认错）。
 错误：`invalid_type` / `invalid_count`（400）；未登录 401。
 
 ### GET /api/admin/cards —— 卡密列表
 
-响应 200：
+查询参数（都可选）：`status=all|unused|used|expired`、`type=all|day|week`、
+`batch=all|latest|<batch_id>`、`q=关键词`（不区分大小写，同时匹配卡密与机器码）、
+`limit=1..1000`（默认 500）、`offset`（默认 0）。响应 200：
 
 ```json
-{"cards": [{"code": "JL-D-…", "type": "day", "status": "unused",
+{"total": 12, "counts": {"unused": 9, "used": 2, "expired": 1},
+ "batches": [{"batch_id": "B20261119123045", "count": 10, "created_at": 1732456789}],
+ "cards": [{"code": "JL-D-…", "type": "day", "status": "unused", "batch_id": "B…",
             "machine_id": null, "used_at": null, "created_at": 1732456789}]}
 ```
 
-`status` 为 `unused`/`used`；`machine_id`、`used_at` 只有用过的卡才有值。列表按生成时间倒序。
+`status`：`used` = 已绑定机器；`expired` = 未用且生成超过 90 天（只作筛选/清理标记，
+不影响激活——久置的卡照样能激活）；其余未用 = `unused`。`counts` 是在 status 之外
+其他筛选条件已筛完的基础上算的各状态计数；`batches` 是全部批次（最新在前）。
+列表按生成时间倒序。错误：`invalid_status` / `invalid_type` / `invalid_paging`（400）；未登录 401。
+
+### POST /api/admin/cards/delete —— 删除卡密
+
+请求二选一：`{"codes": ["JL-D-…", …]}`（按卡号列表，≤1000 张）或
+`{"filter": {"status": …, "type": …, "batch": …, "q": …}}`（按筛选条件删，
+与列表接口同一套筛选语义）。默认只删未用/已过期的卡：如果目标里有已用卡，
+不带 `confirm_used: true` 会返回 400 `{"error": "has_used", "used_count": N, "used": […]}`，
+一张也不删；带上 `confirm_used: true` 才会连已用卡一起删。
+成功响应 200：`{"deleted": […], "deleted_count": N, "not_found": […]}`。
+错误：`ambiguous`（卡号与筛选条件同给）/ `invalid_codes` / `invalid_request` /
+`too_many`（按条件删超过 1000 张）/ `has_used`（400）；未登录 401。
 
 ### POST /api/admin/machines/extend —— 给机器延长时间（售后手动）
 
@@ -133,8 +154,11 @@
 响应 200：`{"set": true, "uses": [{"machine_id": "ab12…", "used_at": 1732456900}]}`。
 `set` 表示是否已设置；`uses` 最新在前，最多 100 条。未登录 401。
 
-管理页也有“卡密管理”区：生成卡密（类型 + 数量）、卡密列表（码、类型、状态、绑定机器前 12 位）、
-给机器延长时间（机器码 + 天数），不用调接口。管理页还有“万能卡”区：密码框式输入 +
+管理页也有“卡密管理”区：生成卡密（类型 + 数量）、卡密列表（码、类型、状态、绑定机器前 12 位、
+批次），带搜索框、状态/类型筛选、“仅看最新批次”开关、“复制当前筛选结果”，列表默认只显示前 10 张
+（可展开全部），右下角有“回顶”“到底”悬浮按钮；每行可勾选，勾选后底部弹出批量操作栏（复制所选 /
+删除所选），也支持单条删除和按筛选条件批量删除，删已用卡或批量删时要二次确认；给机器延长时间
+（机器码 + 天数），不用调接口。管理页还有“万能卡”区：密码框式输入 +
 「保存/更换」按钮，只显示“已设置/未设置”，下面列出使用记录（机器码前 12 位 + 使用时间）。
 
 ## 存储
@@ -144,8 +168,8 @@
 
 - `auth_machines.json`：`{machine_id: {"expire_at": 1732463989, "created_at": 1732456789, "trial": true}}`
   （`trial` 为 true 表示还在试用期；激活过卡密或售后延长过的为 false）
-- `auth_cards.json`：`{code: {"type": "day", "machine_id": "ab12…", "used_at": 1732456900, "created_at": 1732456789}}`
-  （`machine_id`、`used_at` 为 null 表示未使用）
+- `auth_cards.json`：`{code: {"type": "day", "machine_id": "ab12…", "used_at": 1732456900, "created_at": 1732456789, "batch_id": "B20261119123045"}}`
+  （`machine_id`、`used_at` 为 null 表示未使用；`batch_id` 为同批生成的批次号，2026-11-19 之前的旧卡没有这一项）
 - `auth_master_uses.json`：`[{"machine_id": "ab12…", "used_at": 1732456900}]`
   （万能卡使用记录，只留最近 200 条；万能卡本身存在 `config.json` 的 `master_card` 字段里，不进卡库）
 

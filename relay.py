@@ -21,8 +21,9 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   POST /api/admin/release  上传新版安装包（管理员登录 或 X-Release-Token 发布钥匙，multipart 表单）
   POST /api/auth/info      查授权状态（需 X-App-Token + HMAC 签名；新机送 2 小时试用）
   POST /api/auth/activate  激活卡密（需 X-App-Token + HMAC 签名；天卡 +24h，周卡 +7d）
-  POST /api/admin/cards/generate  生成卡密（需管理员登录）
-  GET  /api/admin/cards    卡密列表（需管理员登录）
+  POST /api/admin/cards/generate  生成卡密（需管理员登录；同批卡共享 batch_id）
+  GET  /api/admin/cards    卡密列表（需管理员登录；支持 status/type/batch/q 筛选与搜索，返回总数与各状态计数）
+  POST /api/admin/cards/delete  删除卡密（需管理员登录；按卡号列表或按筛选条件删；默认只删未用/已过期，已用卡须 confirm_used=true 才删）
   POST /api/admin/machines/extend  给机器延长时间（需管理员登录）
   POST /api/admin/master-card  设万能卡（需管理员登录；空字符串 = 清掉）
   GET  /api/admin/master-card  万能卡是否已设置 + 使用记录（需管理员登录）
@@ -47,9 +48,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_APP_TOKEN=""  # 默认空：部署时由 TAT 命令写入 config.json，绝不硬编码
 
@@ -174,7 +175,14 @@ def write_release_info(rdir, info):
 # 存储（配置目录旁，deploy.sh 只下载四个代码文件，绝不碰它们）：
 #   auth_machines.json  {machine_id: {"expire_at": int, "created_at": int, "trial": bool}}
 #   auth_cards.json     {code: {"type": "day"|"week", "machine_id": str|None,
-#                               "used_at": int|None, "created_at": int}}
+#                               "used_at": int|None, "created_at": int,
+#                               "batch_id": str|None}}
+#   批次：一次生成调用里的卡共享一个 batch_id（B + 生成时刻 UTC + 2 位随机码，
+#   例 B20261119123045XK）和一个 batch_seq（全库单调递增的批次序号，
+#   “最新批次”按它判定，不靠秒级 created_at）；2026-11-19 之前生成的旧卡
+#   没有 batch_id/batch_seq，列表里按“旧批次”归类。
+#   状态（列表接口现算）：used = 已绑定机器；expired = 未用且生成超过 CARD_STALE_DAYS 天
+#   （只作筛选/清理标记，不影响激活——久置的卡照样能激活）；其余未用 = unused。
 #   auth_master_uses.json  [{"machine_id": str, "used_at": int}, ...]（万能卡使用记录，只留最近 200 条）
 # HMAC 密钥复用 app_token；请求签名 = HMAC-SHA256 hex，签 machine_id + "|" + timestamp；
 # 响应签名 = HMAC-SHA256 hex，签 machine_id + "|" + expire_at + "|" +
@@ -191,6 +199,28 @@ AUTH_TIME_WINDOW = 300      # 时间戳允差 ±300 秒
 MACHINE_ID_RE = re.compile(r"[0-9a-f]{64}")
 CARD_CODE_RE = re.compile(r"JL-[DW]-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}")
 CARD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 去掉 0/O/1/I/L
+CARD_STALE_DAYS = 90  # 未使用的卡超过这么多天算“已过期”（仅筛选/清理标记，不影响激活）
+CARD_LIST_LIMIT_MAX = 1000  # 列表与按条件删除的单次上限
+CARD_DELETE_MAX = 1000  # 单次删除上限（按卡号列表或按筛选条件都一样）
+
+
+def _new_batch_id(now, existing):
+    """一次生成调用的批次号：B + 生成时刻（UTC，精确到秒）+ 2 位随机码（防同秒碰撞）。"""
+    base = "B" + datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+    suffix = "".join(secrets.choice(CARD_ALPHABET) for _ in range(2))
+    while base + suffix in existing:
+        suffix = "".join(secrets.choice(CARD_ALPHABET) for _ in range(2))
+    return base + suffix
+
+
+def _card_status(c, now):
+    """卡密状态：used 已用 / expired 久置未用（超 CARD_STALE_DAYS 天）/ unused 未用。"""
+    if c.get("machine_id"):
+        return "used"
+    created = c.get("created_at")
+    if isinstance(created, int) and created > 0 and now - created > CARD_STALE_DAYS * 86400:
+        return "expired"
+    return "unused"
 
 
 def _auth_path(name):
@@ -654,6 +684,43 @@ button:disabled{opacity:.6;cursor:default}
 .badge{display:inline-block;font-size:12px;font-weight:700;line-height:1.5;padding:2px 9px;border-radius:999px;vertical-align:1px}
 .badge-unused{background:#dcf2e5;color:var(--ok)}
 .badge-used{background:#e8edef;color:#5b6b72}
+.badge-expired{background:#fdeeda;color:#9a6a12}
+.btn-danger{color:var(--err);border-color:#e3b7b7}
+.btn-danger:active{background:#fbeeee}
+.btn-block{width:100%;margin:10px 0 0}
+.filter-bar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px}
+.filter-bar input[type=search]{flex:2 1 180px;min-width:0;min-height:44px;font-size:16px;
+  padding:10px 12px;border:1px solid #c3d0d5;border-radius:10px;background:#fff;color:var(--ink)}
+.filter-bar select{flex:1 1 120px;min-width:0}
+.filter-bar button{margin:0;flex:none}
+.check-inline{display:inline-flex;align-items:center;gap:8px;font-weight:600;cursor:pointer;
+  min-height:44px;margin:0}
+.check-inline input{width:22px;height:22px;margin:0;flex:none;accent-color:var(--brand)}
+.code-row{display:block;padding:10px 12px;margin:8px 0}
+.code-line1{display:flex;align-items:center;gap:10px}
+.code-line1 .code{flex:1;min-width:0;font-size:14px}
+.code-line2{display:flex;align-items:center;gap:8px;margin-top:8px}
+.code-line2 .code-sub{flex:1;min-width:0}
+.code-row .row-check{flex:none;width:40px;height:40px;display:flex;align-items:center;
+  justify-content:center;margin:0 -6px;cursor:pointer}
+.code-row .row-check input{width:22px;height:22px;margin:0;accent-color:var(--brand)}
+.code-row .badge{flex:none}
+.row-btn{min-height:44px;padding:6px 12px;font-size:14px;flex:none}
+.fab-wrap{position:fixed;right:14px;bottom:16px;display:flex;flex-direction:column;gap:10px;z-index:40}
+.fab-wrap button{width:52px;height:52px;min-height:52px;border-radius:50%;padding:0;margin:0;
+  font-size:14px;background:#fff;box-shadow:0 4px 14px rgba(11,60,70,.28)}
+body.has-selection .fab-wrap{bottom:86px}
+.batch-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;align-items:center;
+  gap:10px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:#fff;
+  border-top:1px solid var(--line);box-shadow:0 -4px 14px rgba(11,60,70,.14)}
+.batch-bar .bar-text{flex:1;min-width:0;font-size:15px;font-weight:600}
+.batch-bar button{margin:0;flex:none}
+.modal{position:fixed;inset:0;z-index:60;background:rgba(10,30,35,.45);display:flex;
+  align-items:center;justify-content:center;padding:20px}
+.modal-card{background:#fff;border-radius:14px;padding:20px;max-width:420px;width:100%;
+  box-shadow:0 8px 28px rgba(10,30,35,.3)}
+.modal-card p{margin:0 0 12px;font-size:15px;line-height:1.7}
+.modal-card .check{margin:4px 0 12px}
 .use-row{display:flex;justify-content:space-between;gap:12px;padding:11px 2px;border-bottom:1px solid var(--line)}
 .use-row:last-child{border-bottom:0}
 .use-row .mid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;word-break:break-all}
@@ -749,13 +816,31 @@ button:disabled{opacity:.6;cursor:default}
 <button class="btn-sm" onclick="copyNewAll(this)">复制全部</button>
 </div>
 <div id="cardsNewList" class="code-list"></div>
-<p class="hint">卡密列表（最新在前，只显示机器码前 12 位）</p>
-<div class="btn-row"><button onclick="loadCards()">刷新卡密列表</button></div>
+<p class="hint">卡密列表（最新在前，只显示机器码前 12 位；未使用的卡超过 90 天算“已过期”，只作清理筛选，照样能激活）。默认只显示前 10 张。</p>
+<div class="filter-bar">
+<input id="cardSearch" type="search" placeholder="搜卡密或机器码" autocomplete="off">
+<select id="cardStatus">
+<option value="all">全部状态</option>
+<option value="unused">未使用</option>
+<option value="used">已使用</option>
+<option value="expired">已过期</option>
+</select>
+<select id="cardTypeFilter">
+<option value="all">全部类型</option>
+<option value="day">天卡</option>
+<option value="week">周卡</option>
+</select>
+<label class="check-inline"><input id="cardLatest" type="checkbox"><span>仅看最新批次</span></label>
+<button class="btn-primary" onclick="loadCards()">筛选</button>
+<button onclick="copyFiltered(this)">复制当前筛选结果</button>
+<button class="btn-danger" onclick="deleteFiltered(this)">删除当前筛选结果</button>
+</div>
 <div id="cardsHead" class="list-head" style="display:none">
-<span id="cardsCount" class="hint"></span>
-<button class="btn-sm" onclick="copyAllCards(this)">复制全部</button>
+<label class="check-inline"><input id="cardsSelectAll" type="checkbox" onchange="toggleSelectAll(this)"><span id="cardsCount" class="hint">共 0 张</span></label>
+<span id="cardsSelCount" class="hint"></span>
 </div>
 <div id="cardsTable" class="code-list"></div>
+<button id="cardsExpand" class="btn-block" style="display:none" onclick="expandCards()">展开全部</button>
 <p id="cardsMsg"></p>
 <label>给机器延长时间（售后手动）</label>
 <input id="extendMachine" type="text" placeholder="机器码（64 位）">
@@ -777,6 +862,22 @@ button:disabled{opacity:.6;cursor:default}
 <div id="masterUsesTable" class="use-list"></div>
 <p id="masterUsesMsg"></p>
 </section>
+</div>
+<div class="fab-wrap">
+<button onclick="window.scrollTo({top:0,behavior:'smooth'})">回顶</button>
+<button onclick="window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})">到底</button>
+</div>
+<div id="batchBar" class="batch-bar" style="display:none">
+<span id="batchBarText" class="bar-text"></span>
+<button onclick="copySelected(this)">复制所选</button>
+<button class="btn-danger" onclick="deleteSelected(this)">删除所选</button>
+</div>
+<div id="confirmModal" class="modal" style="display:none">
+<div class="modal-card">
+<p id="confirmText"></p>
+<label id="confirmUsedWrap" class="check" style="display:none"><input id="confirmUsed" type="checkbox"><span>同时删除已使用的卡</span></label>
+<div class="btn-row"><button class="btn-primary" onclick="confirmDelete()">确认删除</button><button onclick="closeConfirm()">取消</button></div>
+</div>
 </div>
 <script>
 async function api(path,method,body){
@@ -1005,32 +1106,129 @@ function copyListCodes(containerId,btn){
   if(!codes.length){return;}
   copyText(codes.join('\\n'),btn);
 }
-function copyAllCards(btn){copyListCodes('cardsTable',btn);}
 function copyNewAll(btn){copyListCodes('cardsNewList',btn);}
-function codeRow(code,typeLabel,statusLabel,machineShort,usedAt){
+var cardState={cards:[],total:0,counts:{unused:0,used:0,expired:0},expanded:false,selected:{},pendingDelete:null};
+var CARD_PAGE_SIZE=10;
+function statusLabel(st){return st==='used'?'已用':(st==='expired'?'已过期':'未用');}
+function statusBadge(st){return st==='used'?'badge-used':(st==='expired'?'badge-expired':'badge-unused');}
+function fmtBatch(b){
+  if(!b){return '旧批次';}
+  var m=/^B(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(b);
+  if(!m){return '批次 '+b;}
+  return '批次 '+m[2]+'-'+m[3]+' '+m[4]+':'+m[5];
+}
+function cardFilters(){
+  return {
+    q:document.getElementById('cardSearch').value.trim(),
+    status:document.getElementById('cardStatus').value,
+    type:document.getElementById('cardTypeFilter').value,
+    batch:document.getElementById('cardLatest').checked?'latest':'all'
+  };
+}
+function cardQuery(f,limit,offset){
+  var p=[];
+  if(f.q){p.push('q='+encodeURIComponent(f.q));}
+  if(f.status!=='all'){p.push('status='+f.status);}
+  if(f.type!=='all'){p.push('type='+f.type);}
+  if(f.batch!=='all'){p.push('batch='+f.batch);}
+  p.push('limit='+(limit||500));
+  p.push('offset='+(offset||0));
+  return '/api/admin/cards?'+p.join('&');
+}
+function codeRow(c,withActions){
   var row=document.createElement('div'); row.className='code-row';
-  var top=document.createElement('div'); top.className='code-top';
-  var c=document.createElement('div'); c.className='code'; c.textContent=code;
-  var b=document.createElement('button'); b.type='button';
-  b.className='btn-sm'; b.textContent='复制';
-  b.setAttribute('data-code',code);
-  b.onclick=function(){copyText(code,b);};
-  top.appendChild(c); top.appendChild(b); row.appendChild(top);
-  var meta=document.createElement('div'); meta.className='code-meta';
-  var badge=document.createElement('span');
-  badge.className='badge '+(statusLabel==='未用'?'badge-unused':'badge-used');
-  badge.textContent=statusLabel;
-  meta.appendChild(badge);
-  var t=document.createElement('span');
-  t.textContent=' '+typeLabel+' · '+(machineShort?('机器 '+machineShort):'未绑定');
-  meta.appendChild(t);
-  if(usedAt){
-    var tm=document.createElement('span'); tm.className='t';
-    tm.textContent=' · '+fmtTime(usedAt);
-    meta.appendChild(tm);
+  var l1=document.createElement('div'); l1.className='code-line1';
+  if(withActions){
+    var lab=document.createElement('label'); lab.className='row-check';
+    var cb=document.createElement('input'); cb.type='checkbox';
+    cb.checked=!!cardState.selected[c.code];
+    cb.onchange=function(){onCardCheck(c.code,cb.checked);};
+    lab.appendChild(cb); l1.appendChild(lab);
   }
-  row.appendChild(meta);
+  var code=document.createElement('div'); code.className='code'; code.textContent=c.code;
+  l1.appendChild(code);
+  var badge=document.createElement('span');
+  badge.className='badge '+statusBadge(c.status); badge.textContent=statusLabel(c.status);
+  l1.appendChild(badge);
+  row.appendChild(l1);
+  var l2=document.createElement('div'); l2.className='code-line2';
+  var sub=[c.type==='day'?'天卡':'周卡'];
+  if(c.machine_id){sub.push('机器 '+(c.machine_id.slice(0,12)+'…'));}
+  if(c.used_at){sub.push('激活 '+fmtTime(c.used_at));}
+  sub.push(fmtBatch(c.batch_id));
+  var s=document.createElement('div'); s.className='code-sub'; s.textContent=sub.join(' · ');
+  l2.appendChild(s);
+  var b=document.createElement('button'); b.type='button';
+  b.className='row-btn'; b.textContent='复制';
+  b.onclick=function(){copyText(c.code,b);};
+  l2.appendChild(b);
+  if(withActions){
+    var d=document.createElement('button'); d.type='button';
+    d.className='row-btn btn-danger'; d.textContent='删除';
+    d.onclick=function(){openConfirm('one',[c.code]);};
+    l2.appendChild(d);
+  }
+  row.appendChild(l2);
   return row;
+}
+function visibleCards(){
+  return cardState.expanded?cardState.cards:cardState.cards.slice(0,CARD_PAGE_SIZE);
+}
+function renderCards(){
+  var box=document.getElementById('cardsTable');
+  box.innerHTML='';
+  visibleCards().forEach(function(c){box.appendChild(codeRow(c,true));});
+  if(!cardState.cards.length){
+    var e=document.createElement('div'); e.className='empty'; e.textContent='没有符合条件的卡密。';
+    box.appendChild(e);
+  }
+  document.getElementById('cardsHead').style.display=cardState.total?'':'none';
+  document.getElementById('cardsCount').textContent='共 '+cardState.total+' 张（未用 '+(cardState.counts.unused||0)+' · 已用 '+(cardState.counts.used||0)+' · 已过期 '+(cardState.counts.expired||0)+'）';
+  var ex=document.getElementById('cardsExpand');
+  if(cardState.total>CARD_PAGE_SIZE&&!cardState.expanded){
+    ex.style.display=''; ex.textContent='展开全部（共 '+cardState.total+' 张）';
+  }else{
+    ex.style.display='none';
+  }
+  syncSelectAll();
+  updateBatchBar();
+}
+function expandCards(){cardState.expanded=true;renderCards();}
+function syncSelectAll(){
+  var list=visibleCards();
+  document.getElementById('cardsSelectAll').checked=list.length>0&&list.every(function(c){return cardState.selected[c.code];});
+}
+function onCardCheck(code,checked){
+  if(checked){cardState.selected[code]=true;}else{delete cardState.selected[code];}
+  syncSelectAll(); updateBatchBar();
+}
+function toggleSelectAll(cb){
+  visibleCards().forEach(function(c){
+    if(cb.checked){cardState.selected[c.code]=true;}else{delete cardState.selected[c.code];}
+  });
+  renderCards();
+}
+function selectedCodes(){return Object.keys(cardState.selected);}
+function updateBatchBar(){
+  var n=selectedCodes().length;
+  document.getElementById('batchBarText').textContent='已选 '+n+' 张';
+  document.getElementById('cardsSelCount').textContent=n?('已选 '+n+' 张'):'';
+  document.getElementById('batchBar').style.display=n?'':'none';
+  document.body.classList.toggle('has-selection',!!n);
+}
+async function loadCards(){
+  var r=await api(cardQuery(cardFilters(),500,0));
+  var msg=document.getElementById('cardsMsg');
+  if(!r.ok){
+    msg.style.color='#b00';msg.textContent='读取失败：'+(r.data.error||('HTTP '+r.status));return;
+  }
+  msg.textContent='';
+  cardState.cards=r.data.cards||[];
+  cardState.total=r.data.total||0;
+  cardState.counts=r.data.counts||{};
+  cardState.expanded=false;
+  cardState.selected={};
+  renderCards();
 }
 async function genCards(){
   var type=document.getElementById('cardType').value;
@@ -1048,32 +1246,74 @@ async function genCards(){
   var list=document.getElementById('cardsNewList');
   list.innerHTML='';
   r.data.codes.forEach(function(code){
-    list.appendChild(codeRow(code,type==='day'?'天卡':'周卡','未用','',0));
+    list.appendChild(codeRow({code:code,type:type,status:'unused',batch_id:r.data.batch_id,machine_id:null,used_at:null},false));
   });
   document.getElementById('cardsNewCount').textContent='本次生成 '+r.data.codes.length+' 张';
   document.getElementById('cardsNewHead').style.display='';
+  document.getElementById('cardLatest').checked=true;
   loadCards();
 }
-async function loadCards(){
-  var r=await api('/api/admin/cards');
-  var box=document.getElementById('cardsTable');
+async function copyFiltered(btn){
+  var r=await api(cardQuery(cardFilters(),1000,0));
+  var msg=document.getElementById('cardsMsg');
+  if(!r.ok){msg.style.color='#b00';msg.textContent='复制失败：'+(r.data.error||('HTTP '+r.status));return;}
+  var codes=(r.data.cards||[]).map(function(c){return c.code;});
+  if(!codes.length){msg.style.color='#b00';msg.textContent='当前筛选下没有卡密。';return;}
+  copyText(codes.join('\\n'),btn);
+  msg.style.color='#080';msg.textContent='已复制当前筛选结果 '+codes.length+' 张。';
+}
+function copySelected(btn){
+  var codes=selectedCodes();
+  if(!codes.length){return;}
+  copyText(codes.join('\\n'),btn);
+}
+function deleteSelected(){if(selectedCodes().length){openConfirm('selected',selectedCodes());}}
+function deleteFiltered(){if(cardState.total){openConfirm('filter',null);}}
+function openConfirm(kind,codes){
+  cardState.pendingDelete={kind:kind,codes:codes||null};
+  var total=0,used=0;
+  if(kind==='filter'){
+    total=cardState.total; used=cardState.counts.used||0;
+  }else{
+    total=codes.length;
+    used=codes.filter(function(code){
+      for(var i=0;i<cardState.cards.length;i++){
+        if(cardState.cards[i].code===code){return cardState.cards[i].status==='used';}
+      }
+      return false;
+    }).length;
+  }
+  var text=(kind==='filter'?'确定删除当前筛选结果（共 '+total+' 张）吗？删掉后无法恢复。':'确定删除这 '+total+' 张卡密吗？删掉后无法恢复。');
+  if(used>0){text+='其中有 '+used+' 张已使用：删掉只会去掉这张卡的记录，机器上已到账的时间不受影响。';}
+  document.getElementById('confirmText').textContent=text;
+  document.getElementById('confirmUsedWrap').style.display=used>0?'':'none';
+  document.getElementById('confirmUsed').checked=false;
+  document.getElementById('confirmModal').style.display='';
+}
+function closeConfirm(){document.getElementById('confirmModal').style.display='none';cardState.pendingDelete=null;}
+async function confirmDelete(){
+  var p=cardState.pendingDelete;
+  if(!p){closeConfirm();return;}
+  var usedShown=document.getElementById('confirmUsedWrap').style.display!=='none';
+  var confirmUsed=usedShown&&document.getElementById('confirmUsed').checked;
+  var body={confirm_used:confirmUsed};
+  if(p.kind==='filter'){body.filter=cardFilters();}
+  else{body.codes=p.codes;}
+  var r=await api('/api/admin/cards/delete','POST',body);
   var msg=document.getElementById('cardsMsg');
   if(!r.ok){
-    msg.style.color='#b00';msg.textContent='读取失败：'+(r.data.error||('HTTP '+r.status));return;
+    if(r.data.error==='has_used'){
+      document.getElementById('confirmText').textContent='这次删除里有 '+r.data.used_count+' 张已使用的卡。为防止误删，已帮你拦下来了：勾选「同时删除已使用的卡」再点确认删除，就会一起删掉。';
+      document.getElementById('confirmUsedWrap').style.display='';
+      return;
+    }
+    closeConfirm();
+    msg.style.color='#b00';msg.textContent='删除失败：'+(r.data.error||('HTTP '+r.status));return;
   }
-  msg.textContent='';
-  var cards=r.data.cards||[];
-  box.innerHTML='';
-  cards.forEach(function(c){
-    box.appendChild(codeRow(c.code,c.type==='day'?'天卡':'周卡',c.status==='used'?'已用':'未用',
-      c.machine_id?c.machine_id.slice(0,12)+'…':'',c.used_at));
-  });
-  if(!cards.length){
-    var e=document.createElement('div'); e.className='empty'; e.textContent='还没有卡密。';
-    box.appendChild(e);
-  }
-  document.getElementById('cardsCount').textContent='共 '+cards.length+' 张';
-  document.getElementById('cardsHead').style.display=cards.length?'':'none';
+  closeConfirm();
+  cardState.selected={};
+  await loadCards();
+  msg.style.color='#080';msg.textContent='已删除 '+r.data.deleted_count+' 张。';
 }
 async function extendMachine(){
   var mid=document.getElementById('extendMachine').value.trim();
@@ -1271,6 +1511,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_auth_activate()
         elif path == "/api/admin/cards/generate":
             self.handle_admin_cards_generate()
+        elif path == "/api/admin/cards/delete":
+            self.handle_admin_cards_delete()
         elif path == "/api/admin/machines/extend":
             self.handle_admin_machines_extend()
         elif path == "/api/admin/master-card":
@@ -1499,6 +1741,13 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time())
         with AUTH_LOCK:
             cards = _load_auth_store("auth_cards.json")
+            batch_id = _new_batch_id(now, {c.get("batch_id") for c in cards.values()})
+            batch_seq = 0
+            for c in cards.values():
+                s = c.get("batch_seq") or 0
+                if s > batch_seq:
+                    batch_seq = s
+            batch_seq += 1
             codes = []
             for _ in range(count):
                 for _try in range(100):
@@ -1508,28 +1757,164 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     continue  # 100 次都撞码（几乎不可能），跳过这一张
                 cards[code] = {"type": card_type, "machine_id": None,
-                               "used_at": None, "created_at": now}
+                               "used_at": None, "created_at": now,
+                               "batch_id": batch_id, "batch_seq": batch_seq}
                 codes.append(code)
             _save_auth_store("auth_cards.json", cards)
-        self.send_json(200, {"codes": codes})
+        self.send_json(200, {"codes": codes, "batch_id": batch_id})
+
+    def _cards_filtered(self, cards, params, now):
+        """按筛选条件筛卡密（列表与按条件删除共用）。
+        params: {status, type, batch, q}，均为字符串；status 只能是
+        all/unused/used/expired，type 只能是 all/day/week，
+        batch 只能是 all/latest/<具体 batch_id>，q 为关键词（不区分大小写，
+        同时匹配卡密与机器码）。返回 (匹配到的 [(code, c, status)] 列表,
+        各状态计数)。计数在 status 之外其他条件已筛完的基础上算，
+        供筛选栏显示“未使用 N · 已使用 N · 已过期 N”。"""
+        status_f = params.get("status", "all")
+        type_f = params.get("type", "all")
+        batch_f = params.get("batch", "all")
+        q = (params.get("q") or "").strip().lower()
+        if status_f not in ("all", "unused", "used", "expired"):
+            return None, "invalid_status"
+        if type_f not in ("all", "day", "week"):
+            return None, "invalid_type"
+        latest_batch = None
+        if batch_f == "latest":
+            with_batch = [(c.get("batch_seq") or 0, c.get("created_at") or 0,
+                           c.get("batch_id"))
+                          for c in cards.values() if c.get("batch_id")]
+            if with_batch:
+                latest_batch = max(with_batch)[2]
+        matched = []
+        counts = {"unused": 0, "used": 0, "expired": 0}
+        for code, c in cards.items():
+            if type_f != "all" and c.get("type") != type_f:
+                continue
+            if batch_f == "latest":
+                if c.get("batch_id") != latest_batch:
+                    continue
+            elif batch_f != "all" and c.get("batch_id") != batch_f:
+                continue
+            if q and q not in code.lower() and q not in (c.get("machine_id") or "").lower():
+                continue
+            st = _card_status(c, now)
+            counts[st] += 1
+            if status_f != "all" and st != status_f:
+                continue
+            matched.append((code, c, st))
+        matched.sort(key=lambda x: ((x[1].get("created_at") or 0), x[0]), reverse=True)
+        return (matched, counts), None
 
     def handle_admin_cards_list(self):
         if not self.require_login():
             return
+        qs = parse_qs(urlsplit(self.path).query)
+        params = {
+            "status": qs.get("status", ["all"])[0] or "all",
+            "type": qs.get("type", ["all"])[0] or "all",
+            "batch": qs.get("batch", ["all"])[0] or "all",
+            "q": qs.get("q", [""])[0],
+        }
+        try:
+            limit = int(qs.get("limit", ["500"])[0])
+            offset = int(qs.get("offset", ["0"])[0])
+        except ValueError:
+            return self.send_json(400, {"error": "invalid_paging"})
+        if limit < 1 or limit > CARD_LIST_LIMIT_MAX or offset < 0:
+            return self.send_json(400, {"error": "invalid_paging"})
+        now = int(time.time())
         with AUTH_LOCK:
             cards = _load_auth_store("auth_cards.json")
-        items = []
+        result, err = self._cards_filtered(cards, params, now)
+        if err:
+            return self.send_json(400, {"error": err})
+        matched, counts = result
+        total = len(matched)
+        page = matched[offset:offset + limit]
+        items = [{
+            "code": code,
+            "type": c.get("type"),
+            "status": st,
+            "batch_id": c.get("batch_id"),
+            "machine_id": c.get("machine_id"),
+            "used_at": c.get("used_at"),
+            "created_at": c.get("created_at"),
+        } for code, c, st in page]
+        batches = {}
         for code, c in cards.items():
-            items.append({
-                "code": code,
-                "type": c.get("type"),
-                "status": "used" if c.get("machine_id") else "unused",
-                "machine_id": c.get("machine_id"),
-                "used_at": c.get("used_at"),
-                "created_at": c.get("created_at"),
-            })
-        items.sort(key=lambda x: (x["created_at"] or 0, x["code"]), reverse=True)
-        self.send_json(200, {"cards": items})
+            b = c.get("batch_id")
+            if not b:
+                continue
+            cur = batches.get(b)
+            created = c.get("created_at") or 0
+            seq = c.get("batch_seq") or 0
+            if cur is None or created > cur["created_at"]:
+                cur = {"batch_id": b, "count": 0, "created_at": created, "seq": seq}
+                batches[b] = cur
+            cur["count"] += 1
+            if seq > cur["seq"]:
+                cur["seq"] = seq
+        batch_list = sorted(batches.values(),
+                            key=lambda x: (x["seq"], x["created_at"], x["batch_id"]),
+                            reverse=True)
+        for b in batch_list:
+            del b["seq"]
+        self.send_json(200, {"total": total, "counts": counts,
+                             "batches": batch_list, "cards": items})
+
+    def handle_admin_cards_delete(self):
+        if not self.require_login():
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        codes = body.get("codes")
+        filt = body.get("filter")
+        confirm_used = body.get("confirm_used") is True
+        if codes is not None and filt is not None:
+            return self.send_json(400, {"error": "ambiguous"})
+        if codes is not None:
+            if (not isinstance(codes, list)
+                    or not all(isinstance(x, str) for x in codes)
+                    or not codes or len(codes) > CARD_DELETE_MAX):
+                return self.send_json(400, {"error": "invalid_codes"})
+            target_codes = list(dict.fromkeys(codes))  # 去重，保序
+        elif isinstance(filt, dict):
+            params = {k: filt.get(k, "all") if k != "q" else (filt.get(k) or "")
+                      for k in ("status", "type", "batch", "q")}
+            now = int(time.time())
+            with AUTH_LOCK:
+                cards = _load_auth_store("auth_cards.json")
+            result, err = self._cards_filtered(cards, params, now)
+            if err:
+                return self.send_json(400, {"error": err})
+            matched, _counts = result
+            if len(matched) > CARD_DELETE_MAX:
+                return self.send_json(400, {"error": "too_many"})
+            target_codes = [code for code, _c, _st in matched]
+            if not target_codes:
+                return self.send_json(200, {"deleted": [], "deleted_count": 0,
+                                            "not_found": []})
+        else:
+            return self.send_json(400, {"error": "invalid_request"})
+        now = int(time.time())
+        with AUTH_LOCK:
+            cards = _load_auth_store("auth_cards.json")
+            found = {code: cards[code] for code in target_codes if code in cards}
+            not_found = [code for code in target_codes if code not in cards]
+            used = [code for code, c in found.items()
+                    if _card_status(c, now) == "used"]
+            if used and not confirm_used:
+                return self.send_json(400, {"error": "has_used",
+                                            "used_count": len(used),
+                                            "used": used[:10]})
+            for code in found:
+                del cards[code]
+            _save_auth_store("auth_cards.json", cards)
+        deleted = sorted(found)
+        self.send_json(200, {"deleted": deleted, "deleted_count": len(deleted),
+                             "not_found": not_found})
 
     def handle_admin_machines_extend(self):
         if not self.require_login():
