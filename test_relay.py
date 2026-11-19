@@ -183,15 +183,16 @@ def write_config(path, **overrides):
 
 
 class RelayProc:
-    def __init__(self, config_path):
+    def __init__(self, config_path, script=None):
         self.config_path = config_path
+        self.script = script or RELAY_PY
         self.proc = None
 
     def start(self):
         env = dict(os.environ)
         env["RELAY_CONFIG"] = self.config_path
         self.proc = subprocess.Popen(
-            [sys.executable, RELAY_PY], env=env,
+            [sys.executable, self.script], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -240,6 +241,19 @@ def http_req(method, path, body=None, headers=None):
 
 def http_get(path, headers=None):
     return http_req("GET", path, headers=headers)
+
+
+def http_get_logo(path):
+    """取 /logo.jpg，返回 (status, content_type, cache_control, raw_bytes)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", RELAY_PORT, timeout=10)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    raw = resp.read()
+    ctype = resp.getheader("Content-Type")
+    cache = resp.getheader("Cache-Control")
+    status = resp.status
+    conn.close()
+    return status, ctype, cache, raw
 
 
 def http_req_raw(method, path, data, headers=None):
@@ -628,6 +642,69 @@ def test_admin_login_setup_pages():
     status, _, raw, cookie = http_req(
         "POST", "/api/admin/setup", body={"password": ADMIN_PW})
     assert status == 200, "重设密码期望 200，得到 %s：%s" % (status, raw)
+    STATE["cookie"] = cookie.split(";")[0]
+
+
+def test_logo_route():
+    # /logo.jpg：200 + image/jpeg + 长缓存 + 内容与仓库 logo.jpg 逐字节一致
+    logo_path = os.path.join(HERE, "logo.jpg")
+    with open(logo_path, "rb") as f:
+        want = f.read()
+    assert want, "仓库 logo.jpg 为空"
+    status, ctype, cache, raw = http_get_logo("/logo.jpg")
+    assert status == 200, "/logo.jpg 期望 200，得到 %s" % status
+    assert ctype == "image/jpeg", "/logo.jpg Content-Type 不对：%s" % ctype
+    assert cache and "max-age=86400" in cache, "/logo.jpg 缺长缓存头：%s" % cache
+    assert raw == want, "/logo.jpg 内容与仓库 logo.jpg 不一致"
+    # 管理面板：logo 在 h1 上方，只出现一次
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    assert '<img class="logo" src="/logo.jpg" alt="简历猎手">' in raw, "管理页缺 logo"
+    assert raw.count("/logo.jpg") == 1, "管理页 logo 应只出现一次"
+    # 登录页：logo 在标题上方，只出现一次
+    status, _, raw, _ = http_req("GET", "/admin")
+    assert status == 200, "未登录打开 /admin 期望 200，得到 %s" % status
+    assert '<img class="logo" src="/logo.jpg" alt="简历猎手">' in raw, "登录页缺 logo"
+    assert raw.count("/logo.jpg") == 1, "登录页 logo 应只出现一次"
+    # 设密码页：换一份未设密码的配置重启，/admin 应为设密码页且含 logo
+    HOLD["relay"].stop()
+    d5 = tempfile.mkdtemp(prefix="relay-test-logo-setup-")
+    HOLD["tmpdirs"].append(d5)
+    cfg5 = os.path.join(d5, "config.json")
+    write_config(cfg5)
+    relay5 = RelayProc(cfg5)
+    relay5.start()
+    HOLD["relay"] = relay5
+    status, _, raw, _ = http_req("GET", "/admin")
+    assert status == 200, "未设密码打开 /admin 期望 200，得到 %s" % status
+    assert '<img class="logo" src="/logo.jpg" alt="简历猎手">' in raw, "设密码页缺 logo"
+    assert raw.count("/logo.jpg") == 1, "设密码页 logo 应只出现一次"
+    status, _, raw, cookie = http_req(
+        "POST", "/api/admin/setup", body={"password": ADMIN_PW})
+    assert status == 200, "设密码期望 200，得到 %s：%s" % (status, raw)
+    STATE["cookie"] = cookie.split(";")[0]
+    # logo.jpg 缺失时路由应 404：把 relay.py 拷到无 logo 的临时目录单独跑
+    HOLD["relay"].stop()
+    d6 = tempfile.mkdtemp(prefix="relay-test-logo-missing-")
+    HOLD["tmpdirs"].append(d6)
+    script6 = os.path.join(d6, "relay.py")
+    shutil.copy(RELAY_PY, script6)
+    cfg6 = os.path.join(d6, "config.json")
+    write_config(cfg6)
+    relay6 = RelayProc(cfg6, script=script6)
+    relay6.start()
+    HOLD["relay"] = relay6
+    status, data, raw, _ = http_req("GET", "/logo.jpg")
+    assert status == 404, "缺 logo.jpg 时期望 404，得到 %s：%s" % (status, raw)
+    assert data and data.get("error") == "not_found", "缺 logo.jpg 的 404 体不对：%s" % raw
+    relay6.stop()
+    # 恢复主 relay（用 d5 的配置，密码已设），重新登录刷新会话
+    relay7 = RelayProc(cfg5)
+    relay7.start()
+    HOLD["relay"] = relay7
+    status, _, raw, cookie = http_req(
+        "POST", "/api/admin/login", body={"password": ADMIN_PW})
+    assert status == 200, "恢复后登录期望 200，得到 %s：%s" % (status, raw)
     STATE["cookie"] = cookie.split(";")[0]
 
 
@@ -1213,6 +1290,7 @@ TESTS = [
     ("管理页含万能卡区：密码框 / 保存按钮 / 使用记录入口 / 不漏卡值", test_admin_page_master_section),
     ("管理页移动端重排版：标题管理面板 + 复制全部 + 逐行复制 + 不含卡密值", test_admin_page_mobile_layout),
     ("登录页/设密码页按管理面板风格重排版：主色 + 卡片 + 全宽主按钮 + 密码框逻辑", test_admin_login_setup_pages),
+    ("项目 logo：/logo.jpg 200 + 三页含 logo + 缺失 404", test_logo_route),
 ]
 
 

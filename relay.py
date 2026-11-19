@@ -10,6 +10,7 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   GET  /api/version        最新发布信息（需 X-App-Token 请求头；读 version.json）
   GET  /download/latest    下载最新安装包（需 X-App-Token 请求头；流式发回）
   GET  /admin              管理页（设密码 / 登录 / 改配置）
+  GET  /logo.jpg           项目 logo（静态 image/jpeg，取自 relay.py 同目录的 logo.jpg）
   POST /api/admin/setup    首次设置管理员密码
   POST /api/admin/login    管理员登录
   POST /api/admin/logout   管理员退出
@@ -29,7 +30,7 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
 发布文件：安装包放配置目录下的 releases/latest.zip，
 版本信息放配置目录下的 version.json（{"version","size","sha256","notes"}）。
 deploy.sh 只下载 relay.py、config.example.json、jianli-relay.service、
-deploy.sh 四个文件，version.json 与 releases/ 不会被覆盖。
+deploy.sh、logo.jpg 五个文件，version.json 与 releases/ 不会被覆盖。
 
 配置：环境变量 RELAY_CONFIG，默认 /root/jianli-relay/config.json。
 日志只打 stdout，绝不记录 Key / Token / 密码原值。
@@ -479,6 +480,8 @@ body{margin:0;background:var(--bg);color:var(--ink);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   font-size:16px;line-height:1.55}
 .wrap{max-width:440px;margin:0 auto;padding:64px 16px calc(40px + env(safe-area-inset-bottom))}
+.logo{display:block;width:72px;height:72px;border-radius:18px;margin:0 auto 14px;
+  box-shadow:0 1px 3px rgba(16,42,51,.15)}
 h1{font-size:23px;line-height:1.3;margin:0;text-align:center}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
   padding:20px 18px;margin:20px 0;box-shadow:0 1px 3px rgba(16,42,51,.06)}
@@ -501,6 +504,7 @@ button:active{background:var(--brand-dark)}
 </head>
 <body>
 <div class="wrap">
+<img class="logo" src="/logo.jpg" alt="简历猎手">
 <h1>简历猎手 AI 中转</h1>
 <div class="card">
 <h2>设置管理员密码</h2>
@@ -541,6 +545,8 @@ body{margin:0;background:var(--bg);color:var(--ink);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   font-size:16px;line-height:1.55}
 .wrap{max-width:440px;margin:0 auto;padding:64px 16px calc(40px + env(safe-area-inset-bottom))}
+.logo{display:block;width:72px;height:72px;border-radius:18px;margin:0 auto 14px;
+  box-shadow:0 1px 3px rgba(16,42,51,.15)}
 h1{font-size:23px;line-height:1.3;margin:0;text-align:center}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
   padding:20px 18px;margin:20px 0;box-shadow:0 1px 3px rgba(16,42,51,.06)}
@@ -562,6 +568,7 @@ button:active{background:var(--brand-dark)}
 </head>
 <body>
 <div class="wrap">
+<img class="logo" src="/logo.jpg" alt="简历猎手">
 <h1>简历猎手 AI 中转</h1>
 <div class="card">
 <h2>管理员登录</h2>
@@ -601,6 +608,8 @@ body{margin:0;background:var(--bg);color:var(--ink);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   font-size:16px;line-height:1.55}
 .wrap{max-width:720px;margin:0 auto;padding:20px 16px calc(40px + env(safe-area-inset-bottom))}
+.logo{display:block;width:56px;height:56px;border-radius:14px;margin:0 0 12px;
+  box-shadow:0 1px 3px rgba(16,42,51,.15)}
 h1{font-size:23px;line-height:1.3;margin:0}
 .sub{color:var(--muted);font-size:14px;margin:6px 0 0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
@@ -659,6 +668,7 @@ button:disabled{opacity:.6;cursor:default}
 </head>
 <body>
 <div class="wrap">
+<img class="logo" src="/logo.jpg" alt="简历猎手">
 <h1>管理面板</h1>
 <p class="sub">简历猎手 AI 中转</p>
 <p id="stats" class="hint"></p>
@@ -1218,6 +1228,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif path == "/logo.jpg":
+            self.handle_logo()
         elif path == "/api/ai/health":
             self.handle_health()
         elif path == "/api/version":
@@ -1645,6 +1657,27 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # ---- /admin 页面 ----
+    def handle_logo(self):
+        """项目 logo：取 relay.py 同目录的 logo.jpg，静态回 image/jpeg。
+        文件缺失时 404（不 500），不走任何鉴权。"""
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logo.jpg")
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_json(404, {"error": "not_found"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def handle_admin_page(self):
         cfg = config_snapshot()
         if not cfg.get("admin_password_hash"):

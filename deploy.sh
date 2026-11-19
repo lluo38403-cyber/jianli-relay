@@ -4,7 +4,7 @@
 #
 # 用法（腾讯云控制台 TAT「执行命令」）：
 #   1. 先把本目录文件（relay.py、config.example.json、jianli-relay.service、
-#      deploy.sh）传到服务器 /root/jianli-relay/
+#      deploy.sh、logo.jpg）传到服务器 /root/jianli-relay/
 #   2. TAT 里执行一键命令：bash /root/jianli-relay/deploy.sh
 set -euo pipefail
 
@@ -27,6 +27,12 @@ if [ "$SCRIPT_DIR/relay.py" != "$INSTALL_DIR/relay.py" ]; then
   cp -f "$SCRIPT_DIR/relay.py" "$INSTALL_DIR/relay.py"
 fi
 chmod 644 "$INSTALL_DIR/relay.py"
+
+# 项目 logo：有才拷贝（老部署包里没有也不报错）
+if [ -f "$SCRIPT_DIR/logo.jpg" ]; then
+  cp -f "$SCRIPT_DIR/logo.jpg" "$INSTALL_DIR/logo.jpg"
+  chmod 644 "$INSTALL_DIR/logo.jpg"
+fi
 
 # 配置：没有才从模板创建，已有的绝不覆盖
 if [ ! -f "$INSTALL_DIR/config.json" ]; then
