@@ -17,7 +17,7 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   POST /api/admin/config   改配置（立即写盘）
   GET  /api/admin/stats    当天调用统计
   POST /api/admin/models   拉模型列表（需管理员登录，草稿 Key 优先）
-  POST /api/admin/release  上传新版安装包（需管理员登录，multipart 表单）
+  POST /api/admin/release  上传新版安装包（管理员登录 或 X-Release-Token 发布钥匙，multipart 表单）
 
 发布文件：安装包放配置目录下的 releases/latest.zip，
 版本信息放配置目录下的 version.json（{"version","size","sha256","notes"}）。
@@ -52,6 +52,7 @@ DEFAULTS = {
     "api_key": "",
     "ai_enabled": True,
     "app_token": DEFAULT_APP_TOKEN,
+    "release_token": "",  # 发布钥匙：空表示未设置；由服务器端生成，只存 config.json
     "allowed_models": ["glm-4.7-flash", "glm-4-flash-250414"],
     "admin_password_hash": None,
     "port": 8687,
@@ -494,6 +495,7 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <hr>
 <h2>发布新版</h2>
 <p class="hint">上传新的安装包（zip），用户打开面板时会自动收到更新提示。只传 zip，超过 512MB 传不上去。</p>
+<p id="releaseTokenStatus" class="hint"></p>
 <label>安装包（zip）</label>
 <input id="releaseFile" type="file" accept=".zip,application/zip">
 <label>版本号</label>
@@ -521,6 +523,7 @@ async function load(){
   document.getElementById('base_url').value=d.base_url||'';
   document.getElementById('apiKeyMasked').textContent='当前 Key：'+(d.api_key_masked||'（未填）');
   document.getElementById('appTokenMasked').textContent='当前 App-Token：'+(d.app_token_masked||'（未设）');
+  document.getElementById('releaseTokenStatus').textContent='发布钥匙：'+(d.release_token_set?'已设置':'未设置');
   document.getElementById('ai_enabled').checked=!!d.ai_enabled;
   document.getElementById('allowed_models').value=(d.allowed_models||[]).join(', ');
   document.getElementById('daily_limit').value=d.daily_limit_per_ip||'';
@@ -1032,6 +1035,7 @@ class Handler(BaseHTTPRequestHandler):
             "api_key_masked": mask_secret(cfg["api_key"]),
             "ai_enabled": cfg["ai_enabled"],
             "app_token_masked": mask_secret(cfg["app_token"]),
+            "release_token_set": bool(cfg.get("release_token")),
             "allowed_models": list(cfg["allowed_models"]),
             "daily_limit_per_ip": cfg["daily_limit_per_ip"],
         })
@@ -1100,10 +1104,28 @@ class Handler(BaseHTTPRequestHandler):
             "by_ip": counts,
         })
 
-    # ---- 自动更新：上传新版（管理员） ----
+    # ---- 自动更新：上传新版（管理员 或 发布钥匙） ----
+    def _check_release_token(self):
+        """发布钥匙鉴权：X-Release-Token 对上 config.json 里的 release_token。
+
+        未配置（空值）时一律失败（fail closed），只认管理员会话。"""
+        cfg = config_snapshot()
+        expected = cfg.get("release_token") or ""
+        if not expected:
+            return False
+        provided = self.headers.get("X-Release-Token")
+        if not provided:
+            return False
+        try:
+            return hmac.compare_digest(provided.encode("utf-8"),
+                                       expected.encode("utf-8"))
+        except Exception:
+            return False
+
     def handle_admin_release(self):
-        if not self.require_login():
-            return
+        # 管理员会话 OR 发布钥匙，任一通过即可；都不过返回 401
+        if not check_session(self.session_token()) and not self._check_release_token():
+            return self.send_json(401, {"error": "unauthorized"})
         ctype = self.headers.get("Content-Type") or ""
         if "multipart/form-data" not in ctype:
             self.drain_body()

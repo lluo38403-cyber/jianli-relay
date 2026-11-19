@@ -28,6 +28,10 @@
      → 再传 1.0.2 覆盖旧版
   18. 管理页含发布新版表单：文件框 + 版本号 + 更新说明 + 上传按钮
      + 上传逻辑（/api/admin/release、正在上传、512MB 提示），且不含真实 Key/Token
+     + 发布钥匙状态行（发布钥匙：已设置/未设置）
+  19. 发布钥匙鉴权：未配置时带钥匙头仍 401 → 配好后正确钥匙上传成功
+     → 错钥匙 401 → 无钥匙无会话 401 → 管理员会话仍能上传
+     → 错钥匙+有效会话 200；管理页与 config 含 release_token_set 且不漏原值
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -515,6 +519,7 @@ def test_admin_page_release_form():
         'id="releaseNotes"', 'id="releaseBtn"', 'id="releaseMsg"',
         "uploadRelease()", "/api/admin/release",
         "正在上传", "512MB", "1.0.1",
+        "发布钥匙", 'id="releaseTokenStatus"', "release_token_set",
     ]:
         assert needle in raw, "管理页缺发布表单内容：%s" % needle
     # 表单与上传逻辑里不含任何真实 Key/Token
@@ -603,6 +608,89 @@ def test_release_flow():
     assert status == 200 and raw_bytes == z2, "覆盖后下载内容不对"
 
 
+def test_release_token_auth():
+    # 此时 relay 是测试 15 的配置（无 release_token），先验 fail closed：
+    # 未配置发布钥匙时，带任何钥匙头上传都应 401
+    z = make_test_zip("key-one")
+    body, ctype = multipart_body([("version", "1.0.3")],
+                                 [("file", "pkg.zip", z)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, "X-Release-Token": "anything"})
+    assert status == 401, "未配置发布钥匙时带钥匙头应 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 换一份配了 release_token 的配置重启 relay，重新 setup + 登录
+    # （注意：重启后 app_token 回到写配置时的 APP_TOKEN，STATE["app_token"] 是旧轮换值，别用它）
+    HOLD["relay"].stop()
+    d4 = tempfile.mkdtemp(prefix="relay-test-reltoken-")
+    HOLD["tmpdirs"].append(d4)
+    cfg_path = os.path.join(d4, "config.json")
+    RELEASE_TOKEN = "test-release-token-xyz"
+    write_config(cfg_path, release_token=RELEASE_TOKEN)
+    relay4 = RelayProc(cfg_path)
+    relay4.start()
+    HOLD["relay"] = relay4
+    status, _, raw, cookie = http_req(
+        "POST", "/api/admin/setup", body={"password": ADMIN_PW})
+    assert status == 200, "setup 期望 200，得到 %s：%s" % (status, raw)
+    STATE["cookie"] = cookie.split(";")[0]
+    # 管理页含发布钥匙状态行，且不含真实钥匙值
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    assert "发布钥匙" in raw, "管理页缺发布钥匙状态行"
+    assert 'id="releaseTokenStatus"' in raw, "管理页缺 releaseTokenStatus 元素"
+    assert RELEASE_TOKEN not in raw, "管理页泄露了发布钥匙原值"
+    # config 读到 release_token_set=true，且不含原值
+    status, data, raw, _ = http_req("GET", "/api/admin/config", headers=auth_headers())
+    assert status == 200, "config 期望 200，得到 %s：%s" % (status, raw)
+    assert data.get("release_token_set") is True, "release_token_set 应为 true：%s" % raw
+    assert RELEASE_TOKEN not in raw, "config 泄露了发布钥匙原值"
+    # 钥匙正确、无会话 → 200
+    body, ctype = multipart_body([("version", "1.0.3"), ("notes", "钥匙发布")],
+                                 [("file", "pkg.zip", z)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, "X-Release-Token": RELEASE_TOKEN})
+    assert status == 200, "正确钥匙上传期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "version": "1.0.3"}, "返回体不对：%s" % raw
+    # version 对得上：版本号 / 大小 / sha256 / 说明
+    status, data, raw, _ = http_get("/api/version", headers={"X-App-Token": APP_TOKEN})
+    assert status == 200, "钥匙上传后 version 期望 200，得到 %s：%s" % (status, raw)
+    assert data["version"] == "1.0.3", "版本号不对：%s" % raw
+    assert data["size"] == len(z), "大小不对：%s" % raw
+    assert data["sha256"] == hashlib.sha256(z).hexdigest(), "sha256 不对：%s" % raw
+    assert data["notes"] == "钥匙发布", "说明不对：%s" % raw
+    # 错钥匙、无会话 → 401
+    z2 = make_test_zip("key-two")
+    body, ctype = multipart_body([("version", "1.0.4")],
+                                 [("file", "pkg.zip", z2)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, "X-Release-Token": "wrong-key"})
+    assert status == 401, "错钥匙上传期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 无钥匙、无会话 → 401
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body, {"Content-Type": ctype})
+    assert status == 401, "无钥匙无会话上传期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 管理员会话仍能上传（不带钥匙头）
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, **auth_headers()})
+    assert status == 200, "管理员会话上传期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "version": "1.0.4"}, "返回体不对：%s" % raw
+    # 错钥匙 + 有效会话 → 200（会话通过，OR 逻辑）
+    z3 = make_test_zip("key-three")
+    body, ctype = multipart_body([("version", "1.0.5")],
+                                 [("file", "pkg.zip", z3)])
+    status, data, raw, _ = http_req_raw(
+        "POST", "/api/admin/release", body,
+        {"Content-Type": ctype, "X-Release-Token": "wrong-key", **auth_headers()})
+    assert status == 200, "错钥匙+有效会话上传期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "version": "1.0.5"}, "返回体不对：%s" % raw
+
+
 TESTS = [
     ("chat 200 返回桩文本", test_chat_200),
     ("错 Token 401", test_wrong_token_401),
@@ -622,6 +710,7 @@ TESTS = [
     ("管理页含服务商预置下拉框与白名单说明", test_admin_page_presets),
     ("管理页含发布新版表单", test_admin_page_release_form),
     ("自动更新：上传发布 → version/download 核对", test_release_flow),
+    ("发布钥匙鉴权：未配置 401 / 正确钥匙通 / 错钥匙 401 / 会话仍通", test_release_token_auth),
 ]
 
 
