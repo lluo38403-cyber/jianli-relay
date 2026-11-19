@@ -32,15 +32,27 @@
   19. 发布钥匙鉴权：未配置时带钥匙头仍 401 → 配好后正确钥匙上传成功
      → 错钥匙 401 → 无钥匙无会话 401 → 管理员会话仍能上传
      → 错钥匙+有效会话 200；管理页与 config 含 release_token_set 且不漏原值
+  20. 鉴权 info：新机送 2 小时试用、同一机器再查不重复送、响应签名可验
+  21. 鉴权 info 错误：签名错 401、时间戳过期 401、machine_id 格式错 400、
+     无 Token 401、错 Token 401
+  22. 鉴权 activate：天卡/周卡叠加数学、激活后 status active
+  23. 鉴权 activate 错误：重复用 card_used、绑定他人 card_bound_other、
+     不存在的码 / 格式错的码 invalid_card
+  24. 鉴权 activate 签名错误：签名错 400、时间戳过期 400、失败不耗卡
+  25. 管理员卡密：生成（类型/数量校验）与列表（状态、绑定机器）
+  26. 管理员机器延长：已有叠加、新建从现在起算、参数校验
+  27. 管理页含卡密管理区：生成表单 + 列表 + 延长入口
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
 
 import hashlib
+import hmac
 import http.client
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -286,6 +298,298 @@ def chat(token=None, model=None, extra=None):
 
 def auth_headers():
     return {"Cookie": STATE["cookie"]} if STATE["cookie"] else {}
+
+
+# ---------------- 鉴权测试工具 ----------------
+
+MACHINE_A = "a" * 64
+MACHINE_B = "b" * 64
+MACHINE_C = "c" * 64
+AUTH_STATE = {"day_code": None, "week_code": None}
+
+
+def auth_sign(machine_id, timestamp, key=APP_TOKEN):
+    msg = "%s|%d" % (machine_id, timestamp)
+    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def verify_info_sig(data, key=APP_TOKEN):
+    msg = "%s|%d|%d|%d" % (data["machine_id"], data["expire_at"],
+                           data["remaining_seconds"], data["server_time"])
+    expect = hmac.new(key.encode("utf-8"), msg.encode("utf-8"),
+                      hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expect, data["signature"])
+
+
+def auth_info(machine_id, ts=None, sig=None, token=APP_TOKEN):
+    ts = int(time.time()) if ts is None else ts
+    if sig is None:
+        sig = auth_sign(machine_id, ts, key=APP_TOKEN if token else "x")
+    headers = {"X-App-Token": token} if token else {}
+    return http_req("POST", "/api/auth/info",
+                    body={"machine_id": machine_id, "timestamp": ts,
+                          "signature": sig},
+                    headers=headers)
+
+
+def auth_activate(machine_id, card_code, ts=None, sig=None, token=APP_TOKEN):
+    ts = int(time.time()) if ts is None else ts
+    if sig is None:
+        sig = auth_sign(machine_id, ts, key=APP_TOKEN if token else "x")
+    headers = {"X-App-Token": token} if token else {}
+    return http_req("POST", "/api/auth/activate",
+                    body={"machine_id": machine_id, "card_code": card_code,
+                          "timestamp": ts, "signature": sig},
+                    headers=headers)
+
+
+def test_auth_info_trial():
+    # 新机首次来：送 2 小时试用，status trial
+    before = int(time.time())
+    status, data, raw, _ = auth_info(MACHINE_A)
+    after = int(time.time())
+    assert status == 200, "info 新机期望 200，得到 %s：%s" % (status, raw)
+    assert data["machine_id"] == MACHINE_A, "machine_id 不对：%s" % raw
+    assert data["status"] == "trial", "新机应为 trial：%s" % raw
+    assert before + 7200 <= data["expire_at"] <= after + 7200, \
+        "试用过期时间不对：%s" % raw
+    assert 7000 <= data["remaining_seconds"] <= 7200, "试用剩余秒数不对：%s" % raw
+    assert verify_info_sig(data), "响应签名验不过：%s" % raw
+    # 同一机器再查：不重复送，expire_at 不变
+    status, data2, raw, _ = auth_info(MACHINE_A)
+    assert status == 200, "二次查询期望 200，得到 %s：%s" % (status, raw)
+    assert data2["expire_at"] == data["expire_at"], "重复查询不应重送试用：%s" % raw
+    assert data2["status"] == "trial", "二次查询仍应为 trial：%s" % raw
+    assert data2["remaining_seconds"] <= data["remaining_seconds"], \
+        "剩余时间不应倒长：%s" % raw
+    assert verify_info_sig(data2), "二次查询响应签名验不过：%s" % raw
+
+
+def test_auth_info_errors():
+    # 签名错 → 401
+    status, data, raw, _ = auth_info(MACHINE_A, sig="0" * 64)
+    assert status == 401, "错签名 info 期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "bad_signature"}, "错误体不对：%s" % raw
+    # 时间戳过期（400 秒前）→ 401
+    status, data, raw, _ = auth_info(MACHINE_A, ts=int(time.time()) - 400)
+    assert status == 401, "过期时间戳 info 期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "stale_timestamp"}, "错误体不对：%s" % raw
+    # machine_id 格式错 → 400
+    status, data, raw, _ = auth_info("xyz")
+    assert status == 400, "坏 machine_id 期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_machine_id"}, "错误体不对：%s" % raw
+    # 无 App-Token → 401
+    status, data, raw, _ = auth_info(MACHINE_A, token=None)
+    assert status == 401, "无 token info 期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 错 App-Token → 401
+    status, data, raw, _ = auth_info(MACHINE_A, token="wrong-token")
+    assert status == 401, "错 token info 期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # X-Auth-Sign 请求头错了也应 401（body 签名对也没用）
+    ts = int(time.time())
+    status, data, raw, _ = http_req(
+        "POST", "/api/auth/info",
+        body={"machine_id": MACHINE_A, "timestamp": ts,
+              "signature": auth_sign(MACHINE_A, ts)},
+        headers={"X-App-Token": APP_TOKEN, "X-Auth-Sign": "0" * 64})
+    assert status == 401, "错 X-Auth-Sign 期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "bad_signature"}, "错误体不对：%s" % raw
+    # X-Auth-Sign 对了应 200
+    status, data, raw, _ = http_req(
+        "POST", "/api/auth/info",
+        body={"machine_id": MACHINE_A, "timestamp": ts,
+              "signature": auth_sign(MACHINE_A, ts)},
+        headers={"X-App-Token": APP_TOKEN,
+                 "X-Auth-Sign": auth_sign(MACHINE_A, ts)})
+    assert status == 200, "对 X-Auth-Sign 期望 200，得到 %s：%s" % (status, raw)
+
+
+def _gen_cards(card_type, count):
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/generate",
+        body={"type": card_type, "count": count}, headers=auth_headers())
+    assert status == 200, "生成卡密期望 200，得到 %s：%s" % (status, raw)
+    return data["codes"]
+
+
+def test_auth_activate_stacking():
+    # 生成一张天卡并激活：剩余 ≈ 试用剩余 + 86400
+    status, data, raw, _ = auth_info(MACHINE_A)
+    remain_before = data["remaining_seconds"]
+    expire_before = data["expire_at"]
+    day_codes = _gen_cards("day", 1)
+    assert len(day_codes) == 1, "应生成 1 张天卡：%s" % day_codes
+    assert re.fullmatch(r"JL-D-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}",
+                        day_codes[0]), "天卡格式不对：%s" % day_codes[0]
+    status, data, raw, _ = auth_activate(MACHINE_A, day_codes[0])
+    assert status == 200, "天卡激活期望 200，得到 %s：%s" % (status, raw)
+    assert data["added_seconds"] == 86400, "天卡应加 86400 秒：%s" % raw
+    assert data["card_type"] == "day", "卡类型不对：%s" % raw
+    assert data["expire_at"] >= expire_before + 86400 - 2, \
+        "叠加后过期时间不对：%s" % raw
+    assert remain_before + 86400 - 5 <= data["remaining_seconds"] \
+        <= remain_before + 86400, "叠加后剩余不对：%s" % raw
+    AUTH_STATE["day_code"] = day_codes[0]
+    # 再激活一张周卡：再叠加 604800
+    week_codes = _gen_cards("week", 1)
+    assert re.fullmatch(r"JL-W-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}",
+                        week_codes[0]), "周卡格式不对：%s" % week_codes[0]
+    status, data2, raw, _ = auth_activate(MACHINE_A, week_codes[0])
+    assert status == 200, "周卡激活期望 200，得到 %s：%s" % (status, raw)
+    assert data2["added_seconds"] == 604800, "周卡应加 604800 秒：%s" % raw
+    assert data2["card_type"] == "week", "卡类型不对：%s" % raw
+    assert data2["remaining_seconds"] >= data["remaining_seconds"] + 604800 - 5, \
+        "周卡叠加后剩余不对：%s" % raw
+    AUTH_STATE["week_code"] = week_codes[0]
+    # info：已激活，status active，过期时间与激活返回一致
+    status, data3, raw, _ = auth_info(MACHINE_A)
+    assert status == 200, "激活后 info 期望 200，得到 %s：%s" % (status, raw)
+    assert data3["status"] == "active", "激活后应为 active：%s" % raw
+    assert data3["expire_at"] == data2["expire_at"], "info 过期时间应与激活返回一致：%s" % raw
+    assert verify_info_sig(data3), "激活后 info 响应签名验不过：%s" % raw
+
+
+def test_auth_activate_used_and_bound():
+    day_code = AUTH_STATE["day_code"]
+    assert day_code, "前置测试未留下已用天卡"
+    # 自己重复用 → 400 card_used
+    status, data, raw, _ = auth_activate(MACHINE_A, day_code)
+    assert status == 400, "重复激活期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "card_used"}, "错误体不对：%s" % raw
+    # 换台机器用同一张卡 → 400 card_bound_other
+    status, data, raw, _ = auth_activate(MACHINE_B, day_code)
+    assert status == 400, "他人激活已用卡期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "card_bound_other"}, "错误体不对：%s" % raw
+    # 不存在的码（格式对）→ 400 invalid_card
+    status, data, raw, _ = auth_activate(MACHINE_B, "JL-D-AAAA-AAAA-AAAA")
+    assert status == 400, "不存在的卡期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_card"}, "错误体不对：%s" % raw
+    # 格式不对的码（0 不在字符集里）→ 400 invalid_card
+    status, data, raw, _ = auth_activate(MACHINE_B, "JL-D-0000-0000-0000")
+    assert status == 400, "格式错的卡期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_card"}, "错误体不对：%s" % raw
+    status, data, raw, _ = auth_activate(MACHINE_B, "not-a-card")
+    assert status == 400, "乱码期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_card"}, "错误体不对：%s" % raw
+
+
+def test_auth_activate_sig_errors():
+    code = _gen_cards("day", 1)[0]
+    # 签名错 → 400 bad_signature
+    status, data, raw, _ = auth_activate(MACHINE_B, code, sig="0" * 64)
+    assert status == 400, "错签名激活期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "bad_signature"}, "错误体不对：%s" % raw
+    # 时间戳过期 → 400 stale_timestamp
+    status, data, raw, _ = auth_activate(MACHINE_B, code, ts=int(time.time()) - 400)
+    assert status == 400, "过期时间戳激活期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "stale_timestamp"}, "错误体不对：%s" % raw
+    # 无 App-Token → 401
+    status, data, raw, _ = auth_activate(MACHINE_B, code, token=None)
+    assert status == 401, "无 token 激活期望 401，得到 %s：%s" % (status, raw)
+    assert data == {"error": "unauthorized"}, "错误体不对：%s" % raw
+    # 失败的激活不应消耗卡密：之后正常激活应成功
+    status, data, raw, _ = auth_activate(MACHINE_B, code)
+    assert status == 200, "失败后正常激活应成功，得到 %s：%s" % (status, raw)
+    assert data["card_type"] == "day", "卡类型不对：%s" % raw
+
+
+def test_admin_cards_generate_list():
+    # 生成 3 张周卡
+    codes = _gen_cards("week", 3)
+    assert len(codes) == 3, "应生成 3 张：%s" % codes
+    assert len(set(codes)) == 3, "卡密应唯一：%s" % codes
+    for c in codes:
+        assert re.fullmatch(r"JL-W-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}",
+                            c), "周卡格式不对：%s" % c
+    # count 越界 / 非整数 → 400
+    for bad in (0, 101, "3", None):
+        status, data, raw, _ = http_req(
+            "POST", "/api/admin/cards/generate",
+            body={"type": "day", "count": bad}, headers=auth_headers())
+        assert status == 400, "count=%r 期望 400，得到 %s：%s" % (bad, status, raw)
+    # 类型不对 → 400
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/generate",
+        body={"type": "month", "count": 1}, headers=auth_headers())
+    assert status == 400, "坏类型期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_type"}, "错误体不对：%s" % raw
+    # 未登录 → 401
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/cards/generate", body={"type": "day", "count": 1})
+    assert status == 401, "未登录生成卡密期望 401，得到 %s" % status
+    # 列表：含新卡与已用卡，状态、类型、绑定机器对得上
+    status, data, raw, _ = http_req("GET", "/api/admin/cards", headers=auth_headers())
+    assert status == 200, "卡密列表期望 200，得到 %s：%s" % (status, raw)
+    by_code = {c["code"]: c for c in data["cards"]}
+    for c in codes:
+        assert c in by_code, "列表缺新生成的卡：%s" % c
+        assert by_code[c]["status"] == "unused", "新卡应为 unused：%s" % by_code[c]
+        assert by_code[c]["type"] == "week", "新卡类型不对：%s" % by_code[c]
+        assert by_code[c]["machine_id"] is None, "新卡不应绑定机器"
+    day_code = AUTH_STATE["day_code"]
+    assert by_code[day_code]["status"] == "used", "已用卡应为 used：%s" % by_code[day_code]
+    assert by_code[day_code]["machine_id"] == MACHINE_A, "绑定机器不对：%s" % by_code[day_code]
+    assert by_code[day_code]["used_at"], "已用卡应有 used_at"
+    # 未登录读列表 → 401
+    status, _, raw, _ = http_req("GET", "/api/admin/cards")
+    assert status == 401, "未登录读卡密列表期望 401，得到 %s" % status
+
+
+def test_admin_machines_extend():
+    # 给已有机器延长 3600 秒：剩余增加约 3600
+    status, data, raw, _ = auth_info(MACHINE_A)
+    remain_before = data["remaining_seconds"]
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/machines/extend",
+        body={"machine_id": MACHINE_A, "add_seconds": 3600}, headers=auth_headers())
+    assert status == 200, "延长已有机器期望 200，得到 %s：%s" % (status, raw)
+    assert remain_before + 3600 - 5 <= data["remaining_seconds"] \
+        <= remain_before + 3600, "延长后剩余不对：%s" % raw
+    # 给不存在的机器延长：新建记录，从现在起算
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/machines/extend",
+        body={"machine_id": MACHINE_C, "add_seconds": 86400}, headers=auth_headers())
+    assert status == 200, "延长新机器期望 200，得到 %s：%s" % (status, raw)
+    assert 86000 <= data["remaining_seconds"] <= 86400, "新建机器剩余不对：%s" % raw
+    extend_expire = data["expire_at"]
+    status, data, raw, _ = auth_info(MACHINE_C)
+    assert status == 200, "延长后 info 期望 200，得到 %s：%s" % (status, raw)
+    assert data["expire_at"] == extend_expire, "info 应读到延长后的过期时间：%s" % raw
+    assert data["status"] == "active", "售后延长的机器应为 active：%s" % raw
+    # add_seconds 非正整数 → 400
+    for bad in (0, -100, "3600", None):
+        status, data, raw, _ = http_req(
+            "POST", "/api/admin/machines/extend",
+            body={"machine_id": MACHINE_A, "add_seconds": bad}, headers=auth_headers())
+        assert status == 400, "add_seconds=%r 期望 400，得到 %s：%s" % (bad, status, raw)
+    # machine_id 格式错 → 400
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/machines/extend",
+        body={"machine_id": "xyz", "add_seconds": 3600}, headers=auth_headers())
+    assert status == 400, "坏 machine_id 延长期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_machine_id"}, "错误体不对：%s" % raw
+    # 未登录 → 401
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/machines/extend",
+        body={"machine_id": MACHINE_A, "add_seconds": 3600})
+    assert status == 401, "未登录延长机器期望 401，得到 %s" % status
+
+
+def test_admin_page_auth_section():
+    # 管理页应含卡密管理区：生成表单 + 列表 + 延长入口
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    for needle in [
+        "卡密管理", 'id="cardType"', 'id="cardCount"', "genCards()",
+        "/api/admin/cards", "/api/admin/cards/generate",
+        "/api/admin/machines/extend", "extendMachine()",
+        "loadCards()", "天卡", "周卡",
+    ]:
+        assert needle in raw, "管理页缺卡密管理内容：%s" % needle
+    assert API_KEY not in raw, "管理页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
 
 
 # ---------------- 测试用例 ----------------
@@ -711,6 +1015,14 @@ TESTS = [
     ("管理页含发布新版表单", test_admin_page_release_form),
     ("自动更新：上传发布 → version/download 核对", test_release_flow),
     ("发布钥匙鉴权：未配置 401 / 正确钥匙通 / 错钥匙 401 / 会话仍通", test_release_token_auth),
+    ("鉴权 info：新机试用 2 小时 / 不重复送 / 响应签名可验", test_auth_info_trial),
+    ("鉴权 info 错误：错签名 401 / 过期时间戳 401 / 坏 machine_id 400 / 无 token 401", test_auth_info_errors),
+    ("鉴权 activate：天卡周卡叠加 + 激活后 active", test_auth_activate_stacking),
+    ("鉴权 activate 错误：重复用 / 绑定他人 / 不存在的码", test_auth_activate_used_and_bound),
+    ("鉴权 activate 签名错误：错签名 400 / 过期时间戳 400 / 失败不耗卡", test_auth_activate_sig_errors),
+    ("管理员卡密：生成与列表", test_admin_cards_generate_list),
+    ("管理员机器延长：已有叠加 / 新建 / 校验", test_admin_machines_extend),
+    ("管理页含卡密管理区", test_admin_page_auth_section),
 ]
 
 

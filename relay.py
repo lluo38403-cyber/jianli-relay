@@ -18,6 +18,11 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   GET  /api/admin/stats    当天调用统计
   POST /api/admin/models   拉模型列表（需管理员登录，草稿 Key 优先）
   POST /api/admin/release  上传新版安装包（管理员登录 或 X-Release-Token 发布钥匙，multipart 表单）
+  POST /api/auth/info      查授权状态（需 X-App-Token + HMAC 签名；新机送 2 小时试用）
+  POST /api/auth/activate  激活卡密（需 X-App-Token + HMAC 签名；天卡 +24h，周卡 +7d）
+  POST /api/admin/cards/generate  生成卡密（需管理员登录）
+  GET  /api/admin/cards    卡密列表（需管理员登录）
+  POST /api/admin/machines/extend  给机器延长时间（需管理员登录）
 
 发布文件：安装包放配置目录下的 releases/latest.zip，
 版本信息放配置目录下的 version.json（{"version","size","sha256","notes"}）。
@@ -159,6 +164,72 @@ def write_release_info(rdir, info):
         json.dump(info, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     os.chmod(path, 0o600)
+
+
+# ---------------- 鉴权（机器码绑定 + 纯时间制卡密） ----------------
+# 存储（配置目录旁，deploy.sh 只下载四个代码文件，绝不碰它们）：
+#   auth_machines.json  {machine_id: {"expire_at": int, "created_at": int, "trial": bool}}
+#   auth_cards.json     {code: {"type": "day"|"week", "machine_id": str|None,
+#                               "used_at": int|None, "created_at": int}}
+# HMAC 密钥复用 app_token；请求签名 = HMAC-SHA256 hex，签 machine_id + "|" + timestamp；
+# 响应签名 = HMAC-SHA256 hex，签 machine_id + "|" + expire_at + "|" +
+# remaining_seconds + "|" + server_time。时间戳与服务端相差超 300 秒拒收（防重放）。
+# 规范见 AUTH_API.md。
+
+AUTH_LOCK = threading.Lock()  # 机器/卡密读写串行化
+TRIAL_SECONDS = 7200        # 新机免费试用 2 小时
+DAY_SECONDS = 86400         # 天卡 24 小时
+WEEK_SECONDS = 604800       # 周卡 7 天
+AUTH_TIME_WINDOW = 300      # 时间戳允差 ±300 秒
+MACHINE_ID_RE = re.compile(r"[0-9a-f]{64}")
+CARD_CODE_RE = re.compile(r"JL-[DW]-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}")
+CARD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 去掉 0/O/1/I/L
+
+
+def _auth_path(name):
+    return os.path.join(release_dir(), name)
+
+
+def _load_auth_store(name):
+    """读鉴权存储文件；不存在或格式不对返回空 dict。"""
+    try:
+        with open(_auth_path(name), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_auth_store(name, data):
+    """原子写鉴权存储文件（先写临时文件再替换，0600）。"""
+    path = _auth_path(name)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _auth_hmac(key, message):
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _auth_sign_request(key, machine_id, timestamp):
+    return _auth_hmac(key, "%s|%d" % (machine_id, timestamp))
+
+
+def _auth_sign_response(key, machine_id, expire_at, remaining, server_time):
+    return _auth_hmac(key, "%s|%d|%d|%d" % (machine_id, expire_at, remaining, server_time))
+
+
+def _gen_card_code(card_type):
+    prefix = "JL-D-" if card_type == "day" else "JL-W-"
+    groups = "-".join(
+        "".join(secrets.choice(CARD_ALPHABET) for _ in range(4))
+        for _ in range(3))
+    return prefix + groups
 
 
 def _parse_boundary(content_type):
@@ -506,6 +577,28 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <button id="releaseBtn" onclick="uploadRelease()">上传并发布</button>
 </div>
 <p id="releaseMsg"></p>
+<hr>
+<h2>卡密管理</h2>
+<p class="hint">天卡 24 小时，周卡 7 天。卡密首次激活即绑定那台机器并作废，别人再用会报错；同一台机器多张卡时间叠加。</p>
+<label>生成卡密</label>
+<div>
+<select id="cardType" style="font-size:15px;padding:8px">
+<option value="day">天卡（24 小时）</option>
+<option value="week">周卡（7 天）</option>
+</select>
+<input id="cardCount" type="text" value="1" placeholder="数量 1-100" style="width:120px;font-size:15px;padding:8px">
+<button onclick="genCards()">生成</button>
+</div>
+<p id="cardsNew" class="hint" style="word-break:break-all"></p>
+<p class="hint">卡密列表（最新在前，只显示机器码前 12 位）</p>
+<div><button onclick="loadCards()">刷新卡密列表</button></div>
+<table id="cardsTable" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px"></table>
+<p id="cardsMsg"></p>
+<label>给机器延长时间（售后手动）</label>
+<input id="extendMachine" type="text" placeholder="机器码（64 位）">
+<input id="extendDays" type="text" placeholder="延长天数，如 7（支持小数，0.5 = 12 小时）">
+<div><button onclick="extendMachine()">延长</button></div>
+<p id="extendMsg"></p>
 <script>
 async function api(path,method,body){
   var opts={method:method||'GET',headers:{'Content-Type':'application/json'}};
@@ -530,6 +623,7 @@ async function load(){
   syncPreset();
   var s=await api('/api/admin/stats');
   if(s.ok){document.getElementById('stats').textContent='今天（'+s.data.date+'）调用 '+s.data.total_calls+' 次；分 IP：'+JSON.stringify(s.data.by_ip||{});}
+  loadCards();
 }
 var PRESETS={
   zhipu:{provider:'zhipu',base_url:'https://open.bigmodel.cn/api/paas/v4'},
@@ -689,6 +783,58 @@ async function uploadRelease(){
     btn.textContent='上传并发布';
   }
 }
+function fmtTime(ts){
+  if(!ts){return '—';}
+  var d=new Date(ts*1000);
+  function p(n){return ('0'+n).slice(-2);}
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+async function genCards(){
+  var type=document.getElementById('cardType').value;
+  var count=parseInt(document.getElementById('cardCount').value,10);
+  var msg=document.getElementById('cardsNew');
+  if(isNaN(count)||count<1||count>100){
+    msg.style.color='#b00';msg.textContent='数量应为 1-100 的整数。';return;
+  }
+  var r=await api('/api/admin/cards/generate','POST',{type:type,count:count});
+  if(!r.ok){
+    msg.style.color='#b00';msg.textContent='生成失败：'+(r.data.error||('HTTP '+r.status));return;
+  }
+  msg.style.color='#080';
+  msg.textContent='已生成 '+r.data.codes.length+' 张：'+r.data.codes.join('，');
+  loadCards();
+}
+async function loadCards(){
+  var r=await api('/api/admin/cards');
+  var tbl=document.getElementById('cardsTable');
+  var msg=document.getElementById('cardsMsg');
+  if(!r.ok){
+    msg.style.color='#b00';msg.textContent='读取失败：'+(r.data.error||('HTTP '+r.status));return;
+  }
+  msg.textContent='';
+  var rows='<tr><th style="text-align:left">卡密</th><th style="text-align:left">类型</th><th style="text-align:left">状态</th><th style="text-align:left">绑定机器</th><th style="text-align:left">用掉时间</th></tr>';
+  (r.data.cards||[]).forEach(function(c){
+    rows+='<tr><td>'+c.code+'</td><td>'+(c.type==='day'?'天卡':'周卡')+'</td><td>'+(c.status==='used'?'已用':'未用')+'</td><td>'+(c.machine_id?c.machine_id.slice(0,12)+'…':'—')+'</td><td>'+fmtTime(c.used_at)+'</td></tr>';
+  });
+  tbl.innerHTML=rows||'<tr><td>还没有卡密。</td></tr>';
+}
+async function extendMachine(){
+  var mid=document.getElementById('extendMachine').value.trim();
+  var days=parseFloat(document.getElementById('extendDays').value);
+  var msg=document.getElementById('extendMsg');
+  if(!/^[0-9a-f]{64}$/.test(mid)){
+    msg.style.color='#b00';msg.textContent='机器码格式不对，应为 64 位小写字母数字。';return;
+  }
+  if(isNaN(days)||days<=0){
+    msg.style.color='#b00';msg.textContent='天数应为大于 0 的数字。';return;
+  }
+  var r=await api('/api/admin/machines/extend','POST',{machine_id:mid,add_seconds:Math.round(days*86400)});
+  if(!r.ok){
+    msg.style.color='#b00';msg.textContent='延长失败：'+(r.data.error||('HTTP '+r.status));return;
+  }
+  msg.style.color='#080';
+  msg.textContent='已延长，新过期时间 '+fmtTime(r.data.expire_at)+'，剩余约 '+Math.floor(r.data.remaining_seconds/3600)+' 小时。';
+}
 async function logout(){
   await api('/api/admin/logout','POST',{});
   location.reload();
@@ -798,6 +944,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_admin_config_get()
         elif path == "/api/admin/stats":
             self.handle_admin_stats()
+        elif path == "/api/admin/cards":
+            self.handle_admin_cards_list()
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -817,6 +965,14 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_admin_models()
         elif path == "/api/admin/release":
             self.handle_admin_release()
+        elif path == "/api/auth/info":
+            self.handle_auth_info()
+        elif path == "/api/auth/activate":
+            self.handle_auth_activate()
+        elif path == "/api/admin/cards/generate":
+            self.handle_admin_cards_generate()
+        elif path == "/api/admin/machines/extend":
+            self.handle_admin_machines_extend()
         else:
             self.drain_body()
             self.send_json(404, {"error": "not_found"})
@@ -875,6 +1031,210 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             f.close()
+
+    # ---- 鉴权：机器码绑定 + 纯时间制卡密 ----
+    def _auth_app_token(self):
+        """鉴权接口共用：X-App-Token 不对返回 401（与 /api/ai/chat 同方式）。"""
+        cfg = config_snapshot()
+        token = self.headers.get("X-App-Token")
+        if not token or not hmac.compare_digest(token, cfg.get("app_token") or ""):
+            self.send_json(401, {"error": "unauthorized"})
+            return None
+        return cfg
+
+    def _auth_check_request(self, cfg, body, sig_err_status):
+        """校验鉴权请求的 machine_id / timestamp / signature。
+
+        通过返回 (machine_id, timestamp)，失败已回错误并返回 None。
+        machine_id 格式错一律 400；签名错 / 时间戳过期按调用方给的
+        sig_err_status 回（info 用 401，activate 用 400，约定见 AUTH_API.md）。"""
+        machine_id = body.get("machine_id")
+        if not isinstance(machine_id, str) or not MACHINE_ID_RE.fullmatch(machine_id):
+            self.send_json(400, {"error": "invalid_machine_id"})
+            return None
+        ts = body.get("timestamp")
+        if type(ts) is not int:
+            self.send_json(sig_err_status, {"error": "stale_timestamp"})
+            return None
+        now = int(time.time())
+        if abs(now - ts) > AUTH_TIME_WINDOW:
+            self.send_json(sig_err_status, {"error": "stale_timestamp"})
+            return None
+        sig = body.get("signature")
+        expected = _auth_sign_request(cfg.get("app_token") or "", machine_id, ts)
+        if not isinstance(sig, str) or not hmac.compare_digest(sig, expected):
+            self.send_json(sig_err_status, {"error": "bad_signature"})
+            return None
+        hdr_sig = self.headers.get("X-Auth-Sign")
+        if hdr_sig is not None and not hmac.compare_digest(hdr_sig, expected):
+            self.send_json(sig_err_status, {"error": "bad_signature"})
+            return None
+        return machine_id, ts
+
+    def handle_auth_info(self):
+        cfg = self._auth_app_token()
+        if cfg is None:
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        checked = self._auth_check_request(cfg, body, 401)
+        if checked is None:
+            return
+        machine_id, _ts = checked
+        now = int(time.time())
+        with AUTH_LOCK:
+            machines = _load_auth_store("auth_machines.json")
+            rec = machines.get(machine_id)
+            if rec is None:
+                # 新机首次来：建记录，送 2 小时试用（服务端记，删本地文件也没用）
+                rec = {"expire_at": now + TRIAL_SECONDS,
+                       "created_at": now, "trial": True}
+                machines[machine_id] = rec
+                _save_auth_store("auth_machines.json", machines)
+            expire_at = int(rec.get("expire_at") or 0)
+            trial = bool(rec.get("trial"))
+        remaining = max(0, expire_at - now)
+        if remaining <= 0:
+            status = "expired"
+        elif trial:
+            status = "trial"
+        else:
+            status = "active"
+        sig = _auth_sign_response(cfg.get("app_token") or "", machine_id,
+                                  expire_at, remaining, now)
+        self.send_json(200, {
+            "machine_id": machine_id,
+            "expire_at": expire_at,
+            "remaining_seconds": remaining,
+            "status": status,
+            "signature": sig,
+            "server_time": now,
+        })
+
+    def handle_auth_activate(self):
+        cfg = self._auth_app_token()
+        if cfg is None:
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        checked = self._auth_check_request(cfg, body, 400)
+        if checked is None:
+            return
+        machine_id, _ts = checked
+        code = body.get("card_code")
+        if not isinstance(code, str) or not CARD_CODE_RE.fullmatch(code):
+            return self.send_json(400, {"error": "invalid_card"})
+        card_type = "day" if code[3] == "D" else "week"
+        add = DAY_SECONDS if card_type == "day" else WEEK_SECONDS
+        now = int(time.time())
+        err = None
+        result = None
+        with AUTH_LOCK:
+            cards = _load_auth_store("auth_cards.json")
+            card = cards.get(code)
+            if card is None:
+                err = "invalid_card"
+            else:
+                bound = card.get("machine_id")
+                if bound:
+                    err = "card_used" if bound == machine_id else "card_bound_other"
+                else:
+                    machines = _load_auth_store("auth_machines.json")
+                    rec = machines.get(machine_id)
+                    if rec is None:
+                        rec = {"expire_at": now, "created_at": now, "trial": False}
+                        machines[machine_id] = rec
+                    expire_at = max(now, int(rec.get("expire_at") or 0)) + add
+                    rec["expire_at"] = expire_at
+                    rec["trial"] = False
+                    card["machine_id"] = machine_id
+                    card["used_at"] = now
+                    _save_auth_store("auth_cards.json", cards)
+                    _save_auth_store("auth_machines.json", machines)
+                    result = {"expire_at": expire_at,
+                              "remaining_seconds": max(0, expire_at - now),
+                              "added_seconds": add,
+                              "card_type": card_type}
+        if err is not None:
+            return self.send_json(400, {"error": err})
+        self.send_json(200, result)
+
+    def handle_admin_cards_generate(self):
+        if not self.require_login():
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        card_type = body.get("type")
+        if card_type not in ("day", "week"):
+            return self.send_json(400, {"error": "invalid_type"})
+        count = body.get("count")
+        if type(count) is not int or count < 1 or count > 100:
+            return self.send_json(400, {"error": "invalid_count"})
+        now = int(time.time())
+        with AUTH_LOCK:
+            cards = _load_auth_store("auth_cards.json")
+            codes = []
+            for _ in range(count):
+                for _try in range(100):
+                    code = _gen_card_code(card_type)
+                    if code not in cards:
+                        break
+                else:
+                    continue  # 100 次都撞码（几乎不可能），跳过这一张
+                cards[code] = {"type": card_type, "machine_id": None,
+                               "used_at": None, "created_at": now}
+                codes.append(code)
+            _save_auth_store("auth_cards.json", cards)
+        self.send_json(200, {"codes": codes})
+
+    def handle_admin_cards_list(self):
+        if not self.require_login():
+            return
+        with AUTH_LOCK:
+            cards = _load_auth_store("auth_cards.json")
+        items = []
+        for code, c in cards.items():
+            items.append({
+                "code": code,
+                "type": c.get("type"),
+                "status": "used" if c.get("machine_id") else "unused",
+                "machine_id": c.get("machine_id"),
+                "used_at": c.get("used_at"),
+                "created_at": c.get("created_at"),
+            })
+        items.sort(key=lambda x: (x["created_at"] or 0, x["code"]), reverse=True)
+        self.send_json(200, {"cards": items})
+
+    def handle_admin_machines_extend(self):
+        if not self.require_login():
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        machine_id = body.get("machine_id")
+        if not isinstance(machine_id, str) or not MACHINE_ID_RE.fullmatch(machine_id):
+            return self.send_json(400, {"error": "invalid_machine_id"})
+        add = body.get("add_seconds")
+        if type(add) is not int or add <= 0:
+            return self.send_json(400, {"error": "invalid_add_seconds"})
+        now = int(time.time())
+        with AUTH_LOCK:
+            machines = _load_auth_store("auth_machines.json")
+            rec = machines.get(machine_id)
+            if rec is None:
+                rec = {"expire_at": now + add, "created_at": now, "trial": False}
+                machines[machine_id] = rec
+            else:
+                rec["expire_at"] = max(now, int(rec.get("expire_at") or 0)) + add
+            _save_auth_store("auth_machines.json", machines)
+            expire_at = int(rec["expire_at"])
+        self.send_json(200, {
+            "expire_at": expire_at,
+            "remaining_seconds": max(0, expire_at - now),
+        })
 
     def handle_chat(self):
         cfg = config_snapshot()
