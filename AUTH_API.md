@@ -3,7 +3,7 @@
 极简鉴权：无账号密码。客户端按硬件特征算出 `machine_id`，服务端只给每个
 `machine_id` 记一个过期时间 `expire_at`，有效期内不限投递次数。
 
-- 试用：新机器首次调 `/api/auth/info`，服务端自动送 2 小时（服务端记，删本地文件也没用）。
+- 试用：新机器首次调 `/api/auth/info`，服务端自动送 1 小时（服务端记，删本地文件也没用）。
 - 天卡：+24 小时；周卡：+7 天。新过期时间 = `max(现在, 原过期时间) + 时长`，多张卡可叠加。
 - 单卡单机：卡密首次激活即绑定当前机器并作废，别人再用报错，自己重复用也报错。
 
@@ -39,12 +39,12 @@
 响应 200：
 
 ```json
-{"machine_id": "ab12…", "expire_at": 1732463989, "remaining_seconds": 7200,
+{"machine_id": "ab12…", "expire_at": 1732463989, "remaining_seconds": 3600,
  "status": "trial", "signature": "hmac hex", "server_time": 1732456789}
 ```
 
 - `status`：`trial`（试用中）/`active`（卡密有效）/`expired`（已过期，`remaining_seconds` 为 0）。
-- 新机器首次调用：建记录，`expire_at = 现在 + 7200`，`status` 为 `trial`；同一机器再查
+- 新机器首次调用：建记录，`expire_at = 现在 + 3600`，`status` 为 `trial`；同一机器再查
   不重复送，返回现有过期时间对应的剩余秒数。
 - 错误：无/错 App-Token 401 `unauthorized`；签名错 401 `bad_signature`；
   时间戳超 300 秒 401 `stale_timestamp`；`machine_id` 格式错 400 `invalid_machine_id`。

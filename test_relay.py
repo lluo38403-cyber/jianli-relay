@@ -32,7 +32,7 @@
   19. 发布钥匙鉴权：未配置时带钥匙头仍 401 → 配好后正确钥匙上传成功
      → 错钥匙 401 → 无钥匙无会话 401 → 管理员会话仍能上传
      → 错钥匙+有效会话 200；管理页与 config 含 release_token_set 且不漏原值
-  20. 鉴权 info：新机送 2 小时试用、同一机器再查不重复送、响应签名可验
+  20. 鉴权 info：新机送 1 小时试用、同一机器再查不重复送、响应签名可验
   21. 鉴权 info 错误：签名错 401、时间戳过期 401、machine_id 格式错 400、
      无 Token 401、错 Token 401
   22. 鉴权 activate：天卡/周卡叠加数学、激活后 status active
@@ -369,16 +369,16 @@ def auth_activate(machine_id, card_code, ts=None, sig=None, token=APP_TOKEN):
 
 
 def test_auth_info_trial():
-    # 新机首次来：送 2 小时试用，status trial
+    # 新机首次来：送 1 小时试用，status trial
     before = int(time.time())
     status, data, raw, _ = auth_info(MACHINE_A)
     after = int(time.time())
     assert status == 200, "info 新机期望 200，得到 %s：%s" % (status, raw)
     assert data["machine_id"] == MACHINE_A, "machine_id 不对：%s" % raw
     assert data["status"] == "trial", "新机应为 trial：%s" % raw
-    assert before + 7200 <= data["expire_at"] <= after + 7200, \
+    assert before + 3600 <= data["expire_at"] <= after + 3600, \
         "试用过期时间不对：%s" % raw
-    assert 7000 <= data["remaining_seconds"] <= 7200, "试用剩余秒数不对：%s" % raw
+    assert 3400 <= data["remaining_seconds"] <= 3600, "试用剩余秒数不对：%s" % raw
     assert verify_info_sig(data), "响应签名验不过：%s" % raw
     # 同一机器再查：不重复送，expire_at 不变
     status, data2, raw, _ = auth_info(MACHINE_A)
@@ -910,7 +910,7 @@ def test_master_card_flow():
         "GET", "/api/admin/config", headers=auth_headers())
     assert status == 200, "config 期望 200，得到 %s：%s" % (status, raw)
     assert MASTER_CODE not in raw, "config 泄露了万能卡值"
-    # 新机先拿 2 小时试用，再用万能卡激活：剩余 ≈ 试用剩余 + 10 年
+    # 新机先拿 1 小时试用，再用万能卡激活：剩余 ≈ 试用剩余 + 10 年
     status, data, raw, _ = auth_info(MACHINE_D)
     assert status == 200 and data["status"] == "trial", \
         "新机应为 trial：%s" % raw
@@ -1436,7 +1436,7 @@ TESTS = [
     ("管理页含发布新版表单", test_admin_page_release_form),
     ("自动更新：上传发布 → version/download 核对", test_release_flow),
     ("发布钥匙鉴权：未配置 401 / 正确钥匙通 / 错钥匙 401 / 会话仍通", test_release_token_auth),
-    ("鉴权 info：新机试用 2 小时 / 不重复送 / 响应签名可验", test_auth_info_trial),
+    ("鉴权 info：新机试用 1 小时 / 不重复送 / 响应签名可验", test_auth_info_trial),
     ("鉴权 info 错误：错签名 401 / 过期时间戳 401 / 坏 machine_id 400 / 无 token 401", test_auth_info_errors),
     ("鉴权 activate：天卡周卡叠加 + 激活后 active", test_auth_activate_stacking),
     ("鉴权 activate 错误：重复用 / 绑定他人 / 不存在的码", test_auth_activate_used_and_bound),

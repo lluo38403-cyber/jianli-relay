@@ -19,7 +19,7 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   GET  /api/admin/stats    当天调用统计
   POST /api/admin/models   拉模型列表（需管理员登录，草稿 Key 优先）
   POST /api/admin/release  上传新版安装包（管理员登录 或 X-Release-Token 发布钥匙，multipart 表单）
-  POST /api/auth/info      查授权状态（需 X-App-Token + HMAC 签名；新机送 2 小时试用）
+  POST /api/auth/info      查授权状态（需 X-App-Token + HMAC 签名；新机送 1 小时试用）
   POST /api/auth/activate  激活卡密（需 X-App-Token + HMAC 签名；天卡 +24h，周卡 +7d）
   POST /api/admin/cards/generate  生成卡密（需管理员登录；同批卡共享 batch_id）
   GET  /api/admin/cards    卡密列表（需管理员登录；支持 status/type/batch/q 筛选与搜索，返回总数与各状态计数）
@@ -190,7 +190,7 @@ def write_release_info(rdir, info):
 # 规范见 AUTH_API.md。
 
 AUTH_LOCK = threading.Lock()  # 机器/卡密读写串行化
-TRIAL_SECONDS = 7200        # 新机免费试用 2 小时
+TRIAL_SECONDS = 3600        # 新机免费试用 1 小时
 DAY_SECONDS = 86400         # 天卡 24 小时
 WEEK_SECONDS = 604800       # 周卡 7 天
 MASTER_SECONDS = 315360000  # 万能卡 10 年（可叠加、可重复用、不限机器）
@@ -1631,7 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
             machines = _load_auth_store("auth_machines.json")
             rec = machines.get(machine_id)
             if rec is None:
-                # 新机首次来：建记录，送 2 小时试用（服务端记，删本地文件也没用）
+                # 新机首次来：建记录，送 1 小时试用（服务端记，删本地文件也没用）
                 rec = {"expire_at": now + TRIAL_SECONDS,
                        "created_at": now, "trial": True}
                 machines[machine_id] = rec
