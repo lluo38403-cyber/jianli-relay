@@ -23,6 +23,8 @@ exe 不再直连 AI 服务商、不再带 Key，改为调本中转；
   POST /api/admin/cards/generate  生成卡密（需管理员登录）
   GET  /api/admin/cards    卡密列表（需管理员登录）
   POST /api/admin/machines/extend  给机器延长时间（需管理员登录）
+  POST /api/admin/master-card  设万能卡（需管理员登录；空字符串 = 清掉）
+  GET  /api/admin/master-card  万能卡是否已设置 + 使用记录（需管理员登录）
 
 发布文件：安装包放配置目录下的 releases/latest.zip，
 版本信息放配置目录下的 version.json（{"version","size","sha256","notes"}）。
@@ -58,6 +60,7 @@ DEFAULTS = {
     "ai_enabled": True,
     "app_token": DEFAULT_APP_TOKEN,
     "release_token": "",  # 发布钥匙：空表示未设置；由服务器端生成，只存 config.json
+    "master_card": "",  # 万能卡：空表示未设置；由管理员在管理页设定，只存 config.json
     "allowed_models": ["glm-4.7-flash", "glm-4-flash-250414"],
     "admin_password_hash": None,
     "port": 8687,
@@ -171,6 +174,7 @@ def write_release_info(rdir, info):
 #   auth_machines.json  {machine_id: {"expire_at": int, "created_at": int, "trial": bool}}
 #   auth_cards.json     {code: {"type": "day"|"week", "machine_id": str|None,
 #                               "used_at": int|None, "created_at": int}}
+#   auth_master_uses.json  [{"machine_id": str, "used_at": int}, ...]（万能卡使用记录，只留最近 200 条）
 # HMAC 密钥复用 app_token；请求签名 = HMAC-SHA256 hex，签 machine_id + "|" + timestamp；
 # 响应签名 = HMAC-SHA256 hex，签 machine_id + "|" + expire_at + "|" +
 # remaining_seconds + "|" + server_time。时间戳与服务端相差超 300 秒拒收（防重放）。
@@ -180,6 +184,8 @@ AUTH_LOCK = threading.Lock()  # 机器/卡密读写串行化
 TRIAL_SECONDS = 7200        # 新机免费试用 2 小时
 DAY_SECONDS = 86400         # 天卡 24 小时
 WEEK_SECONDS = 604800       # 周卡 7 天
+MASTER_SECONDS = 315360000  # 万能卡 10 年（可叠加、可重复用、不限机器）
+MASTER_USES_MAX = 200       # 万能卡使用记录最多保留条数
 AUTH_TIME_WINDOW = 300      # 时间戳允差 ±300 秒
 MACHINE_ID_RE = re.compile(r"[0-9a-f]{64}")
 CARD_CODE_RE = re.compile(r"JL-[DW]-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}")
@@ -209,6 +215,23 @@ def _save_auth_store(name, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     os.chmod(path, 0o600)
+
+
+def _load_master_uses():
+    """读万能卡使用记录；不存在或格式不对返回空列表。"""
+    try:
+        with open(_auth_path("auth_master_uses.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _record_master_use(machine_id, now):
+    """记一条万能卡使用记录（调用方须已持有 AUTH_LOCK），只留最近 200 条。"""
+    uses = _load_master_uses()
+    uses.append({"machine_id": machine_id, "used_at": now})
+    _save_auth_store("auth_master_uses.json", uses[-MASTER_USES_MAX:])
 
 
 def _auth_hmac(key, message):
@@ -599,6 +622,18 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="extendDays" type="text" placeholder="延长天数，如 7（支持小数，0.5 = 12 小时）">
 <div><button onclick="extendMachine()">延长</button></div>
 <p id="extendMsg"></p>
+<hr>
+<h2>万能卡</h2>
+<p class="hint">内部测试与售后补时用：输入这张卡，任何机器都能直接加 10 年，可重复用、不绑定机器。只留给自己人，绝不要发给买家。</p>
+<label>万能卡（至少 12 个字符）</label>
+<input id="masterCard" type="password" placeholder="输入后点「保存/更换」；留空保存 = 清掉万能卡">
+<p id="masterCardStatus" class="hint"></p>
+<div><button onclick="saveMasterCard()">保存/更换</button></div>
+<p id="masterCardMsg"></p>
+<p class="hint">使用记录（最新在前，只显示机器码前 12 位）</p>
+<div><button onclick="loadMasterCard()">刷新使用记录</button></div>
+<table id="masterUsesTable" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px"></table>
+<p id="masterUsesMsg"></p>
 <script>
 async function api(path,method,body){
   var opts={method:method||'GET',headers:{'Content-Type':'application/json'}};
@@ -624,6 +659,7 @@ async function load(){
   var s=await api('/api/admin/stats');
   if(s.ok){document.getElementById('stats').textContent='今天（'+s.data.date+'）调用 '+s.data.total_calls+' 次；分 IP：'+JSON.stringify(s.data.by_ip||{});}
   loadCards();
+  loadMasterCard();
 }
 var PRESETS={
   zhipu:{provider:'zhipu',base_url:'https://open.bigmodel.cn/api/paas/v4'},
@@ -835,6 +871,37 @@ async function extendMachine(){
   msg.style.color='#080';
   msg.textContent='已延长，新过期时间 '+fmtTime(r.data.expire_at)+'，剩余约 '+Math.floor(r.data.remaining_seconds/3600)+' 小时。';
 }
+async function loadMasterCard(){
+  var r=await api('/api/admin/master-card');
+  var st=document.getElementById('masterCardStatus');
+  var tbl=document.getElementById('masterUsesTable');
+  var msg=document.getElementById('masterUsesMsg');
+  if(!r.ok){
+    st.textContent='万能卡：读取失败';
+    msg.style.color='#b00';msg.textContent='读取失败：'+(r.data.error||('HTTP '+r.status));return;
+  }
+  st.textContent='万能卡：'+(r.data.set?'已设置':'未设置');
+  msg.textContent='';
+  var rows='<tr><th style="text-align:left">机器</th><th style="text-align:left">使用时间</th></tr>';
+  (r.data.uses||[]).forEach(function(u){
+    rows+='<tr><td>'+(u.machine_id?u.machine_id.slice(0,12)+'…':'—')+'</td><td>'+fmtTime(u.used_at)+'</td></tr>';
+  });
+  tbl.innerHTML=rows||'<tr><td>还没有使用记录。</td></tr>';
+}
+async function saveMasterCard(){
+  var code=document.getElementById('masterCard').value;
+  var msg=document.getElementById('masterCardMsg');
+  var r=await api('/api/admin/master-card','POST',{code:code});
+  if(!r.ok){
+    msg.style.color='#b00';
+    msg.textContent=r.data.error==='invalid_master_card'?'保存失败：万能卡至少 12 个字符（留空保存 = 清掉）。':'保存失败：'+(r.data.error||('HTTP '+r.status));
+    return;
+  }
+  msg.style.color='#080';
+  msg.textContent=code?'已保存万能卡。':'已清掉万能卡。';
+  document.getElementById('masterCard').value='';
+  loadMasterCard();
+}
 async function logout(){
   await api('/api/admin/logout','POST',{});
   location.reload();
@@ -946,6 +1013,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_admin_stats()
         elif path == "/api/admin/cards":
             self.handle_admin_cards_list()
+        elif path == "/api/admin/master-card":
+            self.handle_admin_master_card_get()
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -973,6 +1042,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_admin_cards_generate()
         elif path == "/api/admin/machines/extend":
             self.handle_admin_machines_extend()
+        elif path == "/api/admin/master-card":
+            self.handle_admin_master_card_post()
         else:
             self.drain_body()
             self.send_json(404, {"error": "not_found"})
@@ -1124,11 +1195,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         machine_id, _ts = checked
         code = body.get("card_code")
+        now = int(time.time())
+        # 万能卡优先：命中则直接加 10 年，可叠加、可重复用、不限机器；
+        # 绝不写进卡库（auth_cards.json）。没命中再走原有卡密流程。
+        master = cfg.get("master_card") or ""
+        if master and isinstance(code, str) and hmac.compare_digest(code, master):
+            with AUTH_LOCK:
+                machines = _load_auth_store("auth_machines.json")
+                rec = machines.get(machine_id)
+                if rec is None:
+                    rec = {"expire_at": now, "created_at": now, "trial": False}
+                    machines[machine_id] = rec
+                expire_at = max(now, int(rec.get("expire_at") or 0)) + MASTER_SECONDS
+                rec["expire_at"] = expire_at
+                rec["trial"] = False
+                _save_auth_store("auth_machines.json", machines)
+                _record_master_use(machine_id, now)
+            return self.send_json(200, {
+                "expire_at": expire_at,
+                "remaining_seconds": max(0, expire_at - now),
+                "added_seconds": MASTER_SECONDS,
+                "card_type": "master",
+            })
         if not isinstance(code, str) or not CARD_CODE_RE.fullmatch(code):
             return self.send_json(400, {"error": "invalid_card"})
         card_type = "day" if code[3] == "D" else "week"
         add = DAY_SECONDS if card_type == "day" else WEEK_SECONDS
-        now = int(time.time())
         err = None
         result = None
         with AUTH_LOCK:
@@ -1235,6 +1327,40 @@ class Handler(BaseHTTPRequestHandler):
             "expire_at": expire_at,
             "remaining_seconds": max(0, expire_at - now),
         })
+
+    def handle_admin_master_card_get(self):
+        """万能卡状态 + 使用记录：只返回是否已设置，绝不返回卡值。"""
+        if not self.require_login():
+            return
+        cfg = config_snapshot()
+        with AUTH_LOCK:
+            uses = _load_master_uses()
+        # 使用记录是追加式日志，本身按时间正序；倒过来即最新在前
+        # （不用 used_at 排序：同一秒内的多次激活时间戳相同，会乱序）
+        uses = list(reversed(uses))[:100]
+        self.send_json(200, {
+            "set": bool(cfg.get("master_card")),
+            "uses": [{"machine_id": u.get("machine_id"),
+                      "used_at": u.get("used_at")}
+                     for u in uses[:100]],
+        })
+
+    def handle_admin_master_card_post(self):
+        """设万能卡：code 至少 12 个字符；空字符串 = 清掉。立即写盘即生效，不用重启。"""
+        if not self.require_login():
+            return
+        body = self.read_json_body()
+        if body is None:
+            return self.send_json(400, {"error": "invalid_json"})
+        code = body.get("code")
+        if not isinstance(code, str):
+            return self.send_json(400, {"error": "invalid_master_card"})
+        if code != "" and len(code) < 12:
+            return self.send_json(400, {"error": "invalid_master_card"})
+        with CONFIG.lock:
+            CONFIG.data["master_card"] = code
+            CONFIG.save()
+        self.send_json(200, {"ok": True, "set": bool(code)})
 
     def handle_chat(self):
         cfg = config_snapshot()

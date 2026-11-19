@@ -42,6 +42,9 @@
   25. 管理员卡密：生成（类型/数量校验）与列表（状态、绑定机器）
   26. 管理员机器延长：已有叠加、新建从现在起算、参数校验
   27. 管理页含卡密管理区：生成表单 + 列表 + 延长入口
+  28. 万能卡：设/清、激活给 10 年、可叠加可重复用、不限机器、使用记录、
+      未设置时当 invalid_card、任何响应不漏卡值
+  29. 管理页含万能卡区：密码框 + 保存按钮 + 使用记录入口，且不漏卡值
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -592,6 +595,131 @@ def test_admin_page_auth_section():
     assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
 
 
+# ---------------- 万能卡测试 ----------------
+
+MACHINE_D = "d" * 64
+MASTER_CODE = "TEST-MASTER-KEY-1234"
+
+
+def _master_get():
+    return http_req("GET", "/api/admin/master-card", headers=auth_headers())
+
+
+def _master_set(code):
+    return http_req("POST", "/api/admin/master-card",
+                    body={"code": code}, headers=auth_headers())
+
+
+def test_master_card_flow():
+    # 初始：未设置，使用记录为空
+    status, data, raw, _ = _master_get()
+    assert status == 200, "万能卡查询期望 200，得到 %s：%s" % (status, raw)
+    assert data["set"] is False, "初始万能卡应未设置：%s" % raw
+    assert data["uses"] == [], "初始使用记录应为空：%s" % raw
+    # 未登录 → 401
+    status, _, raw, _ = http_req("GET", "/api/admin/master-card")
+    assert status == 401, "未登录查万能卡期望 401，得到 %s" % status
+    status, _, raw, _ = http_req(
+        "POST", "/api/admin/master-card", body={"code": MASTER_CODE})
+    assert status == 401, "未登录设万能卡期望 401，得到 %s" % status
+    # code 太短 / 非字符串 / 缺失 → 400 invalid_master_card
+    for bad in ("short", "12345678901", 123, None):
+        status, data, raw, _ = http_req(
+            "POST", "/api/admin/master-card",
+            body={"code": bad}, headers=auth_headers())
+        assert status == 400, "code=%r 期望 400，得到 %s：%s" % (bad, status, raw)
+        assert data == {"error": "invalid_master_card"}, "错误体不对：%s" % raw
+    # 设置万能卡：响应不回显卡值
+    status, data, raw, _ = _master_set(MASTER_CODE)
+    assert status == 200, "设万能卡期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "set": True}, "返回体不对：%s" % raw
+    assert MASTER_CODE not in raw, "设万能卡响应泄露了卡值"
+    status, data, raw, _ = _master_get()
+    assert status == 200 and data["set"] is True, "设置后应为已设置：%s" % raw
+    assert data["uses"] == [], "刚设置时使用记录应为空：%s" % raw
+    # config 读取也不应漏卡值
+    status, data, raw, _ = http_req(
+        "GET", "/api/admin/config", headers=auth_headers())
+    assert status == 200, "config 期望 200，得到 %s：%s" % (status, raw)
+    assert MASTER_CODE not in raw, "config 泄露了万能卡值"
+    # 新机先拿 2 小时试用，再用万能卡激活：剩余 ≈ 试用剩余 + 10 年
+    status, data, raw, _ = auth_info(MACHINE_D)
+    assert status == 200 and data["status"] == "trial", \
+        "新机应为 trial：%s" % raw
+    remain_before = data["remaining_seconds"]
+    status, data, raw, _ = auth_activate(MACHINE_D, MASTER_CODE)
+    assert status == 200, "万能卡激活期望 200，得到 %s：%s" % (status, raw)
+    assert data["added_seconds"] == 315360000, "万能卡应加 315360000 秒：%s" % raw
+    assert data["card_type"] == "master", "卡类型应为 master：%s" % raw
+    assert remain_before + 315360000 - 5 <= data["remaining_seconds"] \
+        <= remain_before + 315360000, "万能卡激活后剩余不对：%s" % raw
+    assert MASTER_CODE not in raw, "激活响应泄露了卡值"
+    status, data2, raw, _ = auth_info(MACHINE_D)
+    assert status == 200, "激活后 info 期望 200，得到 %s：%s" % (status, raw)
+    assert data2["status"] == "active", "万能卡激活后应为 active：%s" % raw
+    assert data2["expire_at"] == data["expire_at"], "info 过期时间应与激活返回一致"
+    # 同一台机器重复用：再加 10 年（可重复用）
+    status, data3, raw, _ = auth_activate(MACHINE_D, MASTER_CODE)
+    assert status == 200, "重复用万能卡期望 200，得到 %s：%s" % (status, raw)
+    assert data3["remaining_seconds"] >= data["remaining_seconds"] + 315360000 - 5, \
+        "重复用应再加 10 年：%s" % raw
+    # 换台机器也能用（不限机器）
+    status, data, raw, _ = auth_info(MACHINE_B)
+    remain_b = data["remaining_seconds"]
+    status, data, raw, _ = auth_activate(MACHINE_B, MASTER_CODE)
+    assert status == 200, "换机器用万能卡期望 200，得到 %s：%s" % (status, raw)
+    assert remain_b + 315360000 - 5 <= data["remaining_seconds"] \
+        <= remain_b + 315360000, "换机器激活后剩余不对：%s" % raw
+    # 使用记录：3 条，最新在前，机器对得上
+    status, data, raw, _ = _master_get()
+    assert status == 200, "查使用记录期望 200，得到 %s：%s" % (status, raw)
+    assert data["set"] is True, "万能卡应仍为已设置：%s" % raw
+    uses = data["uses"]
+    assert len(uses) == 3, "应记 3 条使用记录，得到 %s" % uses
+    assert uses[0]["machine_id"] == MACHINE_B, "最新一条应为换机器那次：%s" % uses
+    assert uses[1]["machine_id"] == MACHINE_D, "第二条应为重复用那次：%s" % uses
+    assert uses[2]["machine_id"] == MACHINE_D, "第三条应为首次激活：%s" % uses
+    for u in uses:
+        assert isinstance(u["used_at"], int) and u["used_at"] > 0, \
+            "使用记录缺 used_at：%s" % u
+    assert MASTER_CODE not in raw, "使用记录响应泄露了卡值"
+    # 万能卡绝不进卡库
+    status, data, raw, _ = http_req("GET", "/api/admin/cards", headers=auth_headers())
+    assert status == 200, "卡密列表期望 200，得到 %s：%s" % (status, raw)
+    assert MASTER_CODE not in [c["code"] for c in data["cards"]], \
+        "万能卡不应出现在卡密列表里"
+    # 清掉万能卡：该码失效（按普通卡密走，报 invalid_card）
+    status, data, raw, _ = _master_set("")
+    assert status == 200, "清万能卡期望 200，得到 %s：%s" % (status, raw)
+    assert data == {"ok": True, "set": False}, "清掉后返回体不对：%s" % raw
+    status, data, raw, _ = _master_get()
+    assert status == 200 and data["set"] is False, "清掉后应为未设置：%s" % raw
+    status, data, raw, _ = auth_activate(MACHINE_D, MASTER_CODE)
+    assert status == 400, "清掉后万能卡激活期望 400，得到 %s：%s" % (status, raw)
+    assert data == {"error": "invalid_card"}, "错误体不对：%s" % raw
+
+
+def test_admin_page_master_section():
+    # 万能卡区：设卡时管理页含密码框 + 保存按钮 + 使用记录入口，且不漏卡值
+    status, data, raw, _ = _master_set(MASTER_CODE)
+    assert status == 200, "设万能卡期望 200，得到 %s：%s" % (status, raw)
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    for needle in [
+        "万能卡", 'id="masterCard"', 'id="masterCardStatus"',
+        'id="masterUsesTable"', "saveMasterCard()", "loadMasterCard()",
+        "/api/admin/master-card", "10 年",
+    ]:
+        assert needle in raw, "管理页缺万能卡内容：%s" % needle
+    assert MASTER_CODE not in raw, "管理页泄露了万能卡值"
+    assert API_KEY not in raw, "管理页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
+    # 收尾清掉，恢复未设置状态
+    status, data, raw, _ = _master_set("")
+    assert status == 200 and data == {"ok": True, "set": False}, \
+        "收尾清万能卡失败：%s" % raw
+
+
 # ---------------- 测试用例 ----------------
 
 def test_chat_200():
@@ -1023,6 +1151,8 @@ TESTS = [
     ("管理员卡密：生成与列表", test_admin_cards_generate_list),
     ("管理员机器延长：已有叠加 / 新建 / 校验", test_admin_machines_extend),
     ("管理页含卡密管理区", test_admin_page_auth_section),
+    ("万能卡：设/清 / 激活 10 年 / 叠加重复用 / 不限机器 / 使用记录 / 未设置失效 / 不漏卡值", test_master_card_flow),
+    ("管理页含万能卡区：密码框 / 保存按钮 / 使用记录入口 / 不漏卡值", test_admin_page_master_section),
 ]
 
 

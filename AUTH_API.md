@@ -67,6 +67,26 @@
   `card_bound_other`（这张卡已绑别的机器）、`bad_signature`、`stale_timestamp`。
   无/错 App-Token 401 `unauthorized`；`machine_id` 格式错 400 `invalid_machine_id`。
 - 注意：info 的签名/时间戳问题返回 401，activate 的同类问题返回 400（约定如此）。
+- 万能卡（见下节）走同一接口：命中时返回 `card_type: "master"`、`added_seconds: 315360000`。
+
+## 万能卡（管理员内部测试与售后补时）
+
+- 设定：在管理页“万能卡”区输入后点「保存/更换」，或调 `POST /api/admin/master-card`
+ （需管理员登录），值存在服务器 `config.json` 的 `master_card` 字段里，保存后立即生效，
+  不用重启。空字符串 = 未设置、功能关闭。**万能卡值绝不在任何接口响应、管理页、日志里出现；
+  管理页只显示“已设置/未设置”。**
+- 激活行为：`POST /api/auth/activate` 先校验万能卡（仅当已设置时，用
+  `hmac.compare_digest` 比对提交的 `card_code`），命中则新过期时间 =
+  `max(现在, 原过期时间) + 315360000 秒`（10 年），可叠加、可重复用、不限机器，返回
+  `{expire_at, remaining_seconds, added_seconds: 315360000, card_type: "master"}`。
+  命中万能卡时绝不把该码写进卡库。没命中再走原有卡密流程。
+- 轮换：管理页重新保存一个新值即可，旧码立即失效；留空保存 = 清掉万能卡，清掉后该码激活
+  报 `invalid_card`。
+- 审计：每次万能卡激活记一条 `{machine_id, used_at}`，存在 `auth_master_uses.json`
+  （只留最近 200 条），`GET /api/admin/master-card` 返回 `{set: true/false,
+  uses: [{machine_id, used_at}, ...]}`（最新在前，最多 100 条）。
+- 错误：设万能卡时 code 少于 12 个字符报 400 `invalid_master_card`；
+  未设置万能卡时，拿任意码激活都按普通卡密走（查无此码报 `invalid_card`）。
 
 ## 卡密格式与规则
 
@@ -101,8 +121,21 @@
 机器不存在时新建记录，从现在起算（不送试用）；已存在则按叠加规则延长。
 错误：`invalid_machine_id` / `invalid_add_seconds`（400）；未登录 401。
 
+### POST /api/admin/master-card —— 设万能卡
+
+请求：`{"code": "至少 12 个字符"}`；响应 200：`{"ok": true, "set": true}`。
+`code` 为空字符串 = 清掉万能卡（响应 `{"ok": true, "set": false}`）。
+错误：`invalid_master_card`（少于 12 个字符或非字符串，400）；未登录 401。
+保存后立即生效，不用重启；值只存 `config.json`，绝不在响应里回显。
+
+### GET /api/admin/master-card —— 万能卡状态与使用记录
+
+响应 200：`{"set": true, "uses": [{"machine_id": "ab12…", "used_at": 1732456900}]}`。
+`set` 表示是否已设置；`uses` 最新在前，最多 100 条。未登录 401。
+
 管理页也有“卡密管理”区：生成卡密（类型 + 数量）、卡密列表（码、类型、状态、绑定机器前 12 位）、
-给机器延长时间（机器码 + 天数），不用调接口。
+给机器延长时间（机器码 + 天数），不用调接口。管理页还有“万能卡”区：密码框式输入 +
+「保存/更换」按钮，只显示“已设置/未设置”，下面列出使用记录（机器码前 12 位 + 使用时间）。
 
 ## 存储
 
@@ -113,6 +146,8 @@
   （`trial` 为 true 表示还在试用期；激活过卡密或售后延长过的为 false）
 - `auth_cards.json`：`{code: {"type": "day", "machine_id": "ab12…", "used_at": 1732456900, "created_at": 1732456789}}`
   （`machine_id`、`used_at` 为 null 表示未使用）
+- `auth_master_uses.json`：`[{"machine_id": "ab12…", "used_at": 1732456900}]`
+  （万能卡使用记录，只留最近 200 条；万能卡本身存在 `config.json` 的 `master_card` 字段里，不进卡库）
 
 ## 客户端流程（建议）
 
