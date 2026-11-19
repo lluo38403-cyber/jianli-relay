@@ -597,6 +597,40 @@ def test_admin_page_auth_section():
     assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
 
 
+def test_admin_login_setup_pages():
+    # 登录页按管理面板风格重排版：深青蓝主色 + 卡片 + 全宽主按钮，且仍含密码框与登录逻辑；未设密码时应为设密码页
+    status, _, raw, _ = http_req("GET", "/admin")
+    assert status == 200, "未登录打开 /admin 期望 200，得到 %s" % status
+    assert "<title>简历猎手 AI 中转 - 管理员登录</title>" in raw, "登录页标题不对"
+    assert "<h1>简历猎手 AI 中转</h1>" in raw, "登录页 h1 不对"
+    assert 'id="pw"' in raw and 'onclick="login()"' in raw, "登录页缺密码框或登录逻辑"
+    for needle in ["#0B7285", 'class="card"', "btn-block", "min-height:44px"]:
+        assert needle in raw, "登录页缺管理面板视觉标记：%s" % needle
+    assert API_KEY not in raw, "登录页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "登录页泄露了 app_token 原值"
+    # 换一份未设密码的配置重启，/admin 应为设密码页
+    HOLD["relay"].stop()
+    d4 = tempfile.mkdtemp(prefix="relay-test-setup-")
+    HOLD["tmpdirs"].append(d4)
+    cfg_path = os.path.join(d4, "config.json")
+    write_config(cfg_path)
+    relay4 = RelayProc(cfg_path)
+    relay4.start()
+    HOLD["relay"] = relay4
+    status, _, raw, _ = http_req("GET", "/admin")
+    assert status == 200, "未设密码打开 /admin 期望 200，得到 %s" % status
+    assert "<title>简历猎手 AI 中转 - 设置管理员密码</title>" in raw, "设密码页标题不对"
+    assert 'id="pw"' in raw and 'onclick="setup()"' in raw, "设密码页缺密码框或设置逻辑"
+    for needle in ["#0B7285", 'class="card"', "btn-block", "min-height:44px"]:
+        assert needle in raw, "设密码页缺管理面板视觉标记：%s" % needle
+    assert API_KEY not in raw, "设密码页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "设密码页泄露了 app_token 原值"
+    status, _, raw, cookie = http_req(
+        "POST", "/api/admin/setup", body={"password": ADMIN_PW})
+    assert status == 200, "重设密码期望 200，得到 %s：%s" % (status, raw)
+    STATE["cookie"] = cookie.split(";")[0]
+
+
 # ---------------- 万能卡测试 ----------------
 
 MACHINE_D = "d" * 64
@@ -1178,6 +1212,7 @@ TESTS = [
     ("万能卡：设/清 / 激活 10 年 / 叠加重复用 / 不限机器 / 使用记录 / 未设置失效 / 不漏卡值", test_master_card_flow),
     ("管理页含万能卡区：密码框 / 保存按钮 / 使用记录入口 / 不漏卡值", test_admin_page_master_section),
     ("管理页移动端重排版：标题管理面板 + 复制全部 + 逐行复制 + 不含卡密值", test_admin_page_mobile_layout),
+    ("登录页/设密码页按管理面板风格重排版：主色 + 卡片 + 全宽主按钮 + 密码框逻辑", test_admin_login_setup_pages),
 ]
 
 

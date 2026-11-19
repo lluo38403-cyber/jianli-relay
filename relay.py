@@ -465,23 +465,51 @@ PAGE_SETUP = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>简历猎手 AI 中转 - 设置管理员密码</title>
 <style>
-body{font-family:sans-serif;max-width:560px;margin:40px auto;padding:0 16px}
-input,button{font-size:16px;padding:8px;margin:4px 0}
-input{width:100%;box-sizing:border-box}
-button{cursor:pointer}
-#msg{color:#b00}
+:root{
+  --brand:#0B7285; --brand-dark:#096576; --ink:#1c2b31; --muted:#66787f;
+  --line:#dde6e9; --bg:#f2f7fa; --card:#fff; --err:#b3261e;
+  --radius:14px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:16px;line-height:1.55}
+.wrap{max-width:440px;margin:0 auto;padding:64px 16px calc(40px + env(safe-area-inset-bottom))}
+h1{font-size:23px;line-height:1.3;margin:0;text-align:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:20px 18px;margin:20px 0;box-shadow:0 1px 3px rgba(16,42,51,.06)}
+.card>h2{font-size:17px;line-height:1.4;margin:0 0 4px}
+.hint{color:var(--muted);font-size:13px;line-height:1.6;margin:8px 0}
+input[type=password]{width:100%;min-height:44px;margin-top:10px;
+  font-size:16px;padding:10px 12px;border:1px solid #c3d0d5;border-radius:10px;background:#fff;color:var(--ink)}
+input:focus{outline:2px solid var(--brand);outline-offset:1px;border-color:var(--brand)}
+button{font-family:inherit;font-size:15px;min-height:44px;padding:10px 18px;
+  border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#fff;cursor:pointer}
+button:active{background:var(--brand-dark)}
+.btn-block{width:100%;margin:12px 0 0}
+#msg{color:var(--err);font-size:14px;margin:12px 0 0;min-height:1.4em}
+@media (min-width:768px){
+  .wrap{padding-top:110px}
+  h1{font-size:26px}
+  .card{padding:24px}
+}
 </style>
 </head>
 <body>
+<div class="wrap">
 <h1>简历猎手 AI 中转</h1>
+<div class="card">
 <h2>设置管理员密码</h2>
-<p>首次使用，请设置管理员密码（至少 6 位）。设置后即登录管理页。</p>
+<p class="hint">首次使用，请设置管理员密码（至少 6 位）。设置后即登录管理页。</p>
 <input id="pw" type="password" placeholder="管理员密码（≥6 位）" autocomplete="new-password">
-<button onclick="setup()">设置并登录</button>
+<button class="btn-block" onclick="setup()">设置并登录</button>
 <p id="msg"></p>
+</div>
+</div>
 <script>
 async function setup(){
   var pw=document.getElementById('pw').value;
@@ -499,22 +527,49 @@ PAGE_LOGIN = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>简历猎手 AI 中转 - 管理员登录</title>
 <style>
-body{font-family:sans-serif;max-width:560px;margin:40px auto;padding:0 16px}
-input,button{font-size:16px;padding:8px;margin:4px 0}
-input{width:100%;box-sizing:border-box}
-button{cursor:pointer}
-#msg{color:#b00}
+:root{
+  --brand:#0B7285; --brand-dark:#096576; --ink:#1c2b31; --muted:#66787f;
+  --line:#dde6e9; --bg:#f2f7fa; --card:#fff; --err:#b3261e;
+  --radius:14px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:16px;line-height:1.55}
+.wrap{max-width:440px;margin:0 auto;padding:64px 16px calc(40px + env(safe-area-inset-bottom))}
+h1{font-size:23px;line-height:1.3;margin:0;text-align:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:20px 18px;margin:20px 0;box-shadow:0 1px 3px rgba(16,42,51,.06)}
+.card>h2{font-size:17px;line-height:1.4;margin:0 0 4px}
+input[type=password]{width:100%;min-height:44px;margin-top:10px;
+  font-size:16px;padding:10px 12px;border:1px solid #c3d0d5;border-radius:10px;background:#fff;color:var(--ink)}
+input:focus{outline:2px solid var(--brand);outline-offset:1px;border-color:var(--brand)}
+button{font-family:inherit;font-size:15px;min-height:44px;padding:10px 18px;
+  border-radius:10px;border:1px solid var(--brand);background:var(--brand);color:#fff;cursor:pointer}
+button:active{background:var(--brand-dark)}
+.btn-block{width:100%;margin:12px 0 0}
+#msg{color:var(--err);font-size:14px;margin:12px 0 0;min-height:1.4em}
+@media (min-width:768px){
+  .wrap{padding-top:110px}
+  h1{font-size:26px}
+  .card{padding:24px}
+}
 </style>
 </head>
 <body>
+<div class="wrap">
 <h1>简历猎手 AI 中转</h1>
+<div class="card">
 <h2>管理员登录</h2>
 <input id="pw" type="password" placeholder="管理员密码" autocomplete="current-password">
-<button onclick="login()">登录</button>
+<button class="btn-block" onclick="login()">登录</button>
 <p id="msg"></p>
+</div>
+</div>
 <script>
 async function login(){
   var pw=document.getElementById('pw').value;
