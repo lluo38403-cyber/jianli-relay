@@ -28,8 +28,8 @@ if [ "$SCRIPT_DIR/relay.py" != "$INSTALL_DIR/relay.py" ]; then
 fi
 chmod 644 "$INSTALL_DIR/relay.py"
 
-# 项目 logo：有才拷贝（老部署包里没有也不报错）
-if [ -f "$SCRIPT_DIR/logo.jpg" ]; then
+# 项目 logo：有才拷贝（老部署包里没有也不报错；脚本与目标同一文件时不重复拷贝）
+if [ -f "$SCRIPT_DIR/logo.jpg" ] && [ "$SCRIPT_DIR/logo.jpg" != "$INSTALL_DIR/logo.jpg" ]; then
   cp -f "$SCRIPT_DIR/logo.jpg" "$INSTALL_DIR/logo.jpg"
   chmod 644 "$INSTALL_DIR/logo.jpg"
 fi
