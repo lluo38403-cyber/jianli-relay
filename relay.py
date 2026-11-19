@@ -532,24 +532,86 @@ PAGE_CONFIG = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>简历猎手 AI 中转 - 管理</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>管理面板</title>
 <style>
-body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}
-label{display:block;margin:12px 0 4px;font-weight:bold}
-input[type=text],input[type=password]{width:100%;box-sizing:border-box;font-size:15px;padding:8px}
-input[type=file]{width:100%;box-sizing:border-box;font-size:15px;padding:8px 0}
-button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
-.hint{color:#666;font-size:13px}
-#msg{color:#b00}
-#newToken{color:#080;word-break:break-all}
+:root{
+  --brand:#0B7285; --brand-dark:#096576; --ink:#1c2b31; --muted:#66787f;
+  --line:#dde6e9; --bg:#f2f7fa; --card:#fff; --ok:#0b7a4b; --err:#b3261e;
+  --radius:14px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:16px;line-height:1.55}
+.wrap{max-width:720px;margin:0 auto;padding:20px 16px calc(40px + env(safe-area-inset-bottom))}
+h1{font-size:23px;line-height:1.3;margin:0}
+.sub{color:var(--muted);font-size:14px;margin:6px 0 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:18px 16px;margin:18px 0;box-shadow:0 1px 3px rgba(16,42,51,.06)}
+.card>h2{font-size:17px;line-height:1.4;margin:0 0 4px}
+label{display:block;margin:16px 0 6px;font-weight:600;font-size:15px}
+input[type=text],input[type=password],select{width:100%;min-height:44px;
+  font-size:16px;padding:10px 12px;border:1px solid #c3d0d5;border-radius:10px;background:#fff;color:var(--ink)}
+input[type=file]{width:100%;font-size:15px;padding:10px 0}
+input:focus,select:focus{outline:2px solid var(--brand);outline-offset:1px;border-color:var(--brand)}
+button{font-family:inherit;font-size:15px;min-height:44px;padding:10px 18px;margin:8px 8px 0 0;
+  border-radius:10px;border:1px solid #c3d0d5;background:#fff;color:var(--ink);cursor:pointer}
+button:active{background:#eef3f5}
+button:disabled{opacity:.6;cursor:default}
+.btn-primary{background:var(--brand);border-color:var(--brand);color:#fff}
+.btn-primary:active{background:var(--brand-dark)}
+.btn-sm{min-height:38px;padding:6px 14px;font-size:14px}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.btn-row button{margin:0}
+.form-row{display:flex;gap:8px;flex-wrap:wrap;align-items:stretch}
+.form-row select{flex:1 1 150px;min-width:0}
+.form-row .count{flex:0 0 110px;width:110px}
+.form-row button{margin:0;flex:none}
+#modelSelect{flex:1 1 160px;min-width:0}
+.hint{color:var(--muted);font-size:13px;line-height:1.6;margin:8px 0}
+#msg{color:var(--err);font-size:14px}
+#newToken{color:var(--ok);word-break:break-all;font-size:14px}
+.check{display:flex;align-items:flex-start;gap:10px;font-weight:600;cursor:pointer}
+.check input{width:20px;height:20px;margin:2px 0 0;flex:none;accent-color:var(--brand)}
+.list-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:14px 0 4px}
+.list-head .hint{margin:0}
+.list-head button{margin:0;flex:none}
+.code-list{margin:4px 0}
+.code-row{border:1px solid var(--line);border-radius:12px;background:#fff;padding:12px;margin:10px 0}
+.code-top{display:flex;align-items:flex-start;gap:10px}
+.code-top .code{flex:1;min-width:0}
+.code-top button{flex:none}
+.code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:15px;
+  word-break:break-all;overflow-wrap:anywhere}
+.code-meta{margin-top:8px;font-size:13px;color:var(--muted);line-height:1.7}
+.code-meta .t{white-space:nowrap}
+.badge{display:inline-block;font-size:12px;font-weight:700;line-height:1.5;padding:2px 9px;border-radius:999px;vertical-align:1px}
+.badge-unused{background:#dcf2e5;color:var(--ok)}
+.badge-used{background:#e8edef;color:#5b6b72}
+.use-row{display:flex;justify-content:space-between;gap:12px;padding:11px 2px;border-bottom:1px solid var(--line)}
+.use-row:last-child{border-bottom:0}
+.use-row .mid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;word-break:break-all}
+.use-row .time{color:var(--muted);font-size:13px;white-space:nowrap;flex:none}
+.empty{color:var(--muted);font-size:14px;padding:12px 2px}
+@media (min-width:768px){
+  .wrap{padding-top:32px}
+  h1{font-size:26px}
+  .card{padding:22px 24px}
+}
 </style>
 </head>
 <body>
-<h1>简历猎手 AI 中转 - 管理</h1>
+<div class="wrap">
+<h1>管理面板</h1>
+<p class="sub">简历猎手 AI 中转</p>
 <p id="stats" class="hint"></p>
+
+<section class="card">
+<h2>AI 设置</h2>
 <label>服务商（选一个，地址自动填好；Key 仍需自己贴）</label>
-<select id="providerPreset" style="width:100%;box-sizing:border-box;font-size:15px;padding:8px" onchange="applyPreset()">
+<select id="providerPreset" onchange="applyPreset()">
 <option value="zhipu">智谱</option>
 <option value="deepseek">DeepSeek</option>
 <option value="qwen">通义千问</option>
@@ -560,9 +622,9 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="provider" type="text">
 <label>模型 model</label>
 <input id="model" type="text">
-<div>
+<div class="btn-row">
 <button id="fetchModelsBtn" onclick="fetchModels()">获取模型列表</button>
-<select id="modelSelect" style="display:none;font-size:15px;padding:8px;margin:8px 8px 0 0" onchange="pickModel()"></select>
+<select id="modelSelect" style="display:none" onchange="pickModel()"></select>
 </div>
 <p id="modelsMsg" class="hint"></p>
 <label>Base URL</label>
@@ -571,7 +633,7 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="api_key" type="password" placeholder="留空表示沿用" autocomplete="off">
 <p id="apiKeyMasked" class="hint"></p>
 <p id="appTokenMasked" class="hint"></p>
-<label><input id="ai_enabled" type="checkbox"> 启用 AI（关掉后 exe 回落本地规则）</label>
+<label class="check"><input id="ai_enabled" type="checkbox"><span>启用 AI（关掉后 exe 回落本地规则）</span></label>
 <label>允许的模型（逗号分隔）</label>
 <input id="allowed_models" type="text">
 <p class="hint">白名单，精确匹配。「模型」栏当前填的值必须一字不差地列在这里，否则 exe 的请求会被拒（model_not_allowed）。</p>
@@ -579,14 +641,16 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="daily_limit" type="text">
 <label>改管理员密码（留空表示不改，≥6 位）</label>
 <input id="new_password" type="password" placeholder="留空表示不改" autocomplete="new-password">
-<div>
-<button onclick="save()">保存</button>
+<div class="btn-row">
+<button class="btn-primary" onclick="save()">保存</button>
 <button onclick="rotate()">轮换 App-Token</button>
 <button onclick="logout()">退出登录</button>
 </div>
 <p id="newToken"></p>
 <p id="msg"></p>
-<hr>
+</section>
+
+<section class="card">
 <h2>发布新版</h2>
 <p class="hint">上传新的安装包（zip），用户打开面板时会自动收到更新提示。只传 zip，超过 512MB 传不上去。</p>
 <p id="releaseTokenStatus" class="hint"></p>
@@ -596,44 +660,59 @@ button{font-size:15px;padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}
 <input id="releaseVersion" type="text" placeholder="例如 1.0.1" inputmode="numeric">
 <label>更新说明</label>
 <input id="releaseNotes" type="text" placeholder="例如：修复了投递失败的问题（可选）">
-<div>
-<button id="releaseBtn" onclick="uploadRelease()">上传并发布</button>
+<div class="btn-row">
+<button id="releaseBtn" class="btn-primary" onclick="uploadRelease()">上传并发布</button>
 </div>
 <p id="releaseMsg"></p>
-<hr>
+</section>
+
+<section class="card">
 <h2>卡密管理</h2>
 <p class="hint">天卡 24 小时，周卡 7 天。卡密首次激活即绑定那台机器并作废，别人再用会报错；同一台机器多张卡时间叠加。</p>
 <label>生成卡密</label>
-<div>
-<select id="cardType" style="font-size:15px;padding:8px">
+<div class="form-row">
+<select id="cardType">
 <option value="day">天卡（24 小时）</option>
 <option value="week">周卡（7 天）</option>
 </select>
-<input id="cardCount" type="text" value="1" placeholder="数量 1-100" style="width:120px;font-size:15px;padding:8px">
-<button onclick="genCards()">生成</button>
+<input id="cardCount" class="count" type="text" value="1" placeholder="数量 1-100" inputmode="numeric">
+<button class="btn-primary" onclick="genCards()">生成</button>
 </div>
-<p id="cardsNew" class="hint" style="word-break:break-all"></p>
+<p id="cardsNew" class="hint"></p>
+<div id="cardsNewHead" class="list-head" style="display:none">
+<span id="cardsNewCount" class="hint"></span>
+<button class="btn-sm" onclick="copyNewAll(this)">复制全部</button>
+</div>
+<div id="cardsNewList" class="code-list"></div>
 <p class="hint">卡密列表（最新在前，只显示机器码前 12 位）</p>
-<div><button onclick="loadCards()">刷新卡密列表</button></div>
-<table id="cardsTable" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px"></table>
+<div class="btn-row"><button onclick="loadCards()">刷新卡密列表</button></div>
+<div id="cardsHead" class="list-head" style="display:none">
+<span id="cardsCount" class="hint"></span>
+<button class="btn-sm" onclick="copyAllCards(this)">复制全部</button>
+</div>
+<div id="cardsTable" class="code-list"></div>
 <p id="cardsMsg"></p>
 <label>给机器延长时间（售后手动）</label>
 <input id="extendMachine" type="text" placeholder="机器码（64 位）">
 <input id="extendDays" type="text" placeholder="延长天数，如 7（支持小数，0.5 = 12 小时）">
-<div><button onclick="extendMachine()">延长</button></div>
+<div class="btn-row"><button class="btn-primary" onclick="extendMachine()">延长</button></div>
 <p id="extendMsg"></p>
-<hr>
+</section>
+
+<section class="card">
 <h2>万能卡</h2>
 <p class="hint">内部测试与售后补时用：输入这张卡，任何机器都能直接加 10 年，可重复用、不绑定机器。只留给自己人，绝不要发给买家。</p>
 <label>万能卡（至少 12 个字符）</label>
 <input id="masterCard" type="password" placeholder="输入后点「保存/更换」；留空保存 = 清掉万能卡">
 <p id="masterCardStatus" class="hint"></p>
-<div><button onclick="saveMasterCard()">保存/更换</button></div>
+<div class="btn-row"><button class="btn-primary" onclick="saveMasterCard()">保存/更换</button></div>
 <p id="masterCardMsg"></p>
 <p class="hint">使用记录（最新在前，只显示机器码前 12 位）</p>
-<div><button onclick="loadMasterCard()">刷新使用记录</button></div>
-<table id="masterUsesTable" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px"></table>
+<div class="btn-row"><button onclick="loadMasterCard()">刷新使用记录</button></div>
+<div id="masterUsesTable" class="use-list"></div>
 <p id="masterUsesMsg"></p>
+</section>
+</div>
 <script>
 async function api(path,method,body){
   var opts={method:method||'GET',headers:{'Content-Type':'application/json'}};
@@ -825,6 +904,69 @@ function fmtTime(ts){
   function p(n){return ('0'+n).slice(-2);}
   return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
 }
+// 复制：http 页面 navigator.clipboard 不可用，用 textarea + execCommand 兜底；
+// iOS 要先 focus 再 setSelectionRange，调用必须在点击手势里同步发生。
+function copyText(text,btn){
+  function done(ok){
+    if(!btn){return;}
+    var old=btn.textContent;
+    btn.textContent=ok?'已复制':'复制失败';
+    btn.disabled=true;
+    setTimeout(function(){btn.textContent=old;btn.disabled=false;},1500);
+  }
+  function fallback(){
+    var ta=document.createElement('textarea');
+    ta.value=text;
+    ta.setAttribute('readonly','');
+    ta.style.cssText='position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:0;outline:0;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.setSelectionRange(0,ta.value.length);
+    var ok=false;
+    try{ok=document.execCommand('copy');}catch(e){ok=false;}
+    document.body.removeChild(ta);
+    done(ok);
+  }
+  if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){done(true);},fallback);
+  }else{
+    fallback();
+  }
+}
+function copyListCodes(containerId,btn){
+  var codes=[];
+  var els=document.getElementById(containerId).querySelectorAll('.code');
+  for(var i=0;i<els.length;i++){codes.push(els[i].textContent);}
+  if(!codes.length){return;}
+  copyText(codes.join('\\n'),btn);
+}
+function copyAllCards(btn){copyListCodes('cardsTable',btn);}
+function copyNewAll(btn){copyListCodes('cardsNewList',btn);}
+function codeRow(code,typeLabel,statusLabel,machineShort,usedAt){
+  var row=document.createElement('div'); row.className='code-row';
+  var top=document.createElement('div'); top.className='code-top';
+  var c=document.createElement('div'); c.className='code'; c.textContent=code;
+  var b=document.createElement('button'); b.type='button';
+  b.className='btn-sm'; b.textContent='复制';
+  b.setAttribute('data-code',code);
+  b.onclick=function(){copyText(code,b);};
+  top.appendChild(c); top.appendChild(b); row.appendChild(top);
+  var meta=document.createElement('div'); meta.className='code-meta';
+  var badge=document.createElement('span');
+  badge.className='badge '+(statusLabel==='未用'?'badge-unused':'badge-used');
+  badge.textContent=statusLabel;
+  meta.appendChild(badge);
+  var t=document.createElement('span');
+  t.textContent=' '+typeLabel+' · '+(machineShort?('机器 '+machineShort):'未绑定');
+  meta.appendChild(t);
+  if(usedAt){
+    var tm=document.createElement('span'); tm.className='t';
+    tm.textContent=' · '+fmtTime(usedAt);
+    meta.appendChild(tm);
+  }
+  row.appendChild(meta);
+  return row;
+}
 async function genCards(){
   var type=document.getElementById('cardType').value;
   var count=parseInt(document.getElementById('cardCount').value,10);
@@ -837,22 +979,36 @@ async function genCards(){
     msg.style.color='#b00';msg.textContent='生成失败：'+(r.data.error||('HTTP '+r.status));return;
   }
   msg.style.color='#080';
-  msg.textContent='已生成 '+r.data.codes.length+' 张：'+r.data.codes.join('，');
+  msg.textContent='已生成 '+r.data.codes.length+' 张：';
+  var list=document.getElementById('cardsNewList');
+  list.innerHTML='';
+  r.data.codes.forEach(function(code){
+    list.appendChild(codeRow(code,type==='day'?'天卡':'周卡','未用','',0));
+  });
+  document.getElementById('cardsNewCount').textContent='本次生成 '+r.data.codes.length+' 张';
+  document.getElementById('cardsNewHead').style.display='';
   loadCards();
 }
 async function loadCards(){
   var r=await api('/api/admin/cards');
-  var tbl=document.getElementById('cardsTable');
+  var box=document.getElementById('cardsTable');
   var msg=document.getElementById('cardsMsg');
   if(!r.ok){
     msg.style.color='#b00';msg.textContent='读取失败：'+(r.data.error||('HTTP '+r.status));return;
   }
   msg.textContent='';
-  var rows='<tr><th style="text-align:left">卡密</th><th style="text-align:left">类型</th><th style="text-align:left">状态</th><th style="text-align:left">绑定机器</th><th style="text-align:left">用掉时间</th></tr>';
-  (r.data.cards||[]).forEach(function(c){
-    rows+='<tr><td>'+c.code+'</td><td>'+(c.type==='day'?'天卡':'周卡')+'</td><td>'+(c.status==='used'?'已用':'未用')+'</td><td>'+(c.machine_id?c.machine_id.slice(0,12)+'…':'—')+'</td><td>'+fmtTime(c.used_at)+'</td></tr>';
+  var cards=r.data.cards||[];
+  box.innerHTML='';
+  cards.forEach(function(c){
+    box.appendChild(codeRow(c.code,c.type==='day'?'天卡':'周卡',c.status==='used'?'已用':'未用',
+      c.machine_id?c.machine_id.slice(0,12)+'…':'',c.used_at));
   });
-  tbl.innerHTML=rows||'<tr><td>还没有卡密。</td></tr>';
+  if(!cards.length){
+    var e=document.createElement('div'); e.className='empty'; e.textContent='还没有卡密。';
+    box.appendChild(e);
+  }
+  document.getElementById('cardsCount').textContent='共 '+cards.length+' 张';
+  document.getElementById('cardsHead').style.display=cards.length?'':'none';
 }
 async function extendMachine(){
   var mid=document.getElementById('extendMachine').value.trim();
@@ -874,7 +1030,7 @@ async function extendMachine(){
 async function loadMasterCard(){
   var r=await api('/api/admin/master-card');
   var st=document.getElementById('masterCardStatus');
-  var tbl=document.getElementById('masterUsesTable');
+  var box=document.getElementById('masterUsesTable');
   var msg=document.getElementById('masterUsesMsg');
   if(!r.ok){
     st.textContent='万能卡：读取失败';
@@ -882,11 +1038,19 @@ async function loadMasterCard(){
   }
   st.textContent='万能卡：'+(r.data.set?'已设置':'未设置');
   msg.textContent='';
-  var rows='<tr><th style="text-align:left">机器</th><th style="text-align:left">使用时间</th></tr>';
-  (r.data.uses||[]).forEach(function(u){
-    rows+='<tr><td>'+(u.machine_id?u.machine_id.slice(0,12)+'…':'—')+'</td><td>'+fmtTime(u.used_at)+'</td></tr>';
+  var uses=r.data.uses||[];
+  box.innerHTML='';
+  uses.forEach(function(u){
+    var row=document.createElement('div'); row.className='use-row';
+    var m=document.createElement('span'); m.className='mid';
+    m.textContent=u.machine_id?u.machine_id.slice(0,12)+'…':'—';
+    var t=document.createElement('span'); t.className='time'; t.textContent=fmtTime(u.used_at);
+    row.appendChild(m); row.appendChild(t); box.appendChild(row);
   });
-  tbl.innerHTML=rows||'<tr><td>还没有使用记录。</td></tr>';
+  if(!uses.length){
+    var e=document.createElement('div'); e.className='empty'; e.textContent='还没有使用记录。';
+    box.appendChild(e);
+  }
 }
 async function saveMasterCard(){
   var code=document.getElementById('masterCard').value;

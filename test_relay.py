@@ -45,6 +45,8 @@
   28. 万能卡：设/清、激活给 10 年、可叠加可重复用、不限机器、使用记录、
       未设置时当 invalid_card、任何响应不漏卡值
   29. 管理页含万能卡区：密码框 + 保存按钮 + 使用记录入口，且不漏卡值
+  30. 管理页移动端重排版：标题「管理面板」+ 复制全部 + 逐行复制标记，
+      卡密表与万能卡记录表已换成纵向列表，且页面 HTML 里不含卡密值
 
 全部通过退出 0，否则退出 1，并打印通过数。
 """
@@ -720,6 +722,28 @@ def test_admin_page_master_section():
         "收尾清万能卡失败：%s" % raw
 
 
+def test_admin_page_mobile_layout():
+    # 管理面板移动端重排版：新标题 + 复制全部 + 逐行复制标记，且页面 HTML 里不含任何卡密值
+    status, data, raw, _ = http_req(
+        "POST", "/api/admin/cards/generate",
+        body={"type": "day", "count": 2}, headers=auth_headers())
+    assert status == 200, "生成卡密期望 200，得到 %s：%s" % (status, raw)
+    codes = data["codes"]
+    assert len(codes) == 2, "应生成 2 张卡密：%s" % raw
+    status, _, raw, _ = http_req("GET", "/admin", headers=auth_headers())
+    assert status == 200, "管理页期望 200，得到 %s" % status
+    assert "<title>管理面板</title>" in raw, "管理页标题应为管理面板"
+    assert "<h1>管理面板</h1>" in raw, "管理页 h1 应为管理面板"
+    for needle in ["复制全部", "copyText(", "data-code",
+                   "copyAllCards(", "copyNewAll("]:
+        assert needle in raw, "管理页缺移动端复制内容：%s" % needle
+    assert "<table" not in raw, "管理页不应再含 table 布局"
+    for code in codes:
+        assert code not in raw, "管理页 HTML 里不应含卡密值"
+    assert API_KEY not in raw, "管理页泄露了 api_key 原值"
+    assert APP_TOKEN not in raw, "管理页泄露了 app_token 原值"
+
+
 # ---------------- 测试用例 ----------------
 
 def test_chat_200():
@@ -1153,6 +1177,7 @@ TESTS = [
     ("管理页含卡密管理区", test_admin_page_auth_section),
     ("万能卡：设/清 / 激活 10 年 / 叠加重复用 / 不限机器 / 使用记录 / 未设置失效 / 不漏卡值", test_master_card_flow),
     ("管理页含万能卡区：密码框 / 保存按钮 / 使用记录入口 / 不漏卡值", test_admin_page_master_section),
+    ("管理页移动端重排版：标题管理面板 + 复制全部 + 逐行复制 + 不含卡密值", test_admin_page_mobile_layout),
 ]
 
 
